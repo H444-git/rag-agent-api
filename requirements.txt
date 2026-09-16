@@ -1,0 +1,12 @@
+fastapi
+uvicorn
+requests
+numpy
+faiss-cpu
+text2vec
+langchain-text-splitters
+tavily-python
+pymupdf
+python-docx
+colorlog
+python-dotenv
