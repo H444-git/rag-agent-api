@@ -1,4 +1,5 @@
 import os
+import threading
 
 from dotenv import load_dotenv
 
@@ -145,28 +146,33 @@ def parse_file(filename, file_bytes):
 
 
 knowledge = load_knowledge("知识库简易版.txt", chunk_size=150)
-knowledge_vecs = model.encode(knowledge) if knowledge else []
 
 import faiss
 
-# 将知识向量转为 float32（FAISS 要求的数据类型）
-knowledge_vecs_faiss = np.array(knowledge_vecs).astype("float32")
-
-# 获取向量维度
-dim = knowledge_vecs_faiss.shape[1]
-
 # 创建 FAISS 索引（使用内积索引，配合归一化实现余弦相似度）
-index = faiss.IndexFlatIP(dim)  # IP = Inner Product（内积）
-# 归一化向量，使内积等于余弦相似度
-faiss.normalize_L2(knowledge_vecs_faiss)
-index.add(knowledge_vecs_faiss)
+if knowledge:
+    knowledge_vecs = model.encode(knowledge)
+    knowledge_vecs_faiss = np.array(knowledge_vecs).astype("float32")
+    dim = knowledge_vecs_faiss.shape[1]
+    index = faiss.IndexFlatIP(dim)  # IP = Inner Product（内积）
+    faiss.normalize_L2(knowledge_vecs_faiss)
+    index.add(knowledge_vecs_faiss)
+else:
+    # 知识库为空时，用占位文本推断向量维度，创建空索引，避免 shape[1] 越界崩溃
+    dim = model.encode([""]).shape[1]
+    index = faiss.IndexFlatIP(dim)
+
+# 保护 knowledge 列表与 FAISS index 的共享可变状态，
+# 避免并发上传导致文本块与向量错位（数据完整性问题）
+_knowledge_lock = threading.Lock()
 
 print(f"✅ FAISS 索引已创建，包含 {index.ntotal} 条知识向量")
 
 
 def get_all_knowledge():
     """返回当前知识库里的所有文本块"""
-    return knowledge
+    with _knowledge_lock:
+        return list(knowledge)
 
 
 def add_knowledge(new_chunks):
@@ -176,6 +182,10 @@ def add_knowledge(new_chunks):
     """
     global knowledge
 
+    if not new_chunks:
+        logger.info("新增块为空，跳过知识库更新")
+        return 0, len(knowledge)
+
     # 1. 向量化
     new_vecs = model.encode(new_chunks)
     new_vecs_faiss = np.array(new_vecs).astype("float32")
@@ -184,8 +194,11 @@ def add_knowledge(new_chunks):
     faiss.normalize_L2(new_vecs_faiss)
 
     # 3. 追加到 knowledge 和 index，保证顺序一致
-    knowledge.extend(new_chunks)
-    index.add(new_vecs_faiss)
+    # 必须在锁内原子地完成列表与索引的同步追加，
+    # 否则并发上传会导致文本块与向量错位，返回错误答案
+    with _knowledge_lock:
+        knowledge.extend(new_chunks)
+        index.add(new_vecs_faiss)
 
     # 打印新增的每一块内容
     for i, chunk in enumerate(new_chunks):
@@ -204,23 +217,26 @@ def search_mostk(query_vec, K=16, threshold=0.4):
     query_vec_faiss = np.array([query_vec]).astype("float32")
     faiss.normalize_L2(query_vec_faiss)
 
-    # FAISS 检索
-    distances, indices = index.search(query_vec_faiss, K)
+    # FAISS 检索与 knowledge 读取必须在同一把锁内，
+    # 保证 indices 与 knowledge 列表的一致性（避免并发上传导致错位）
+    with _knowledge_lock:
+        distances, indices = index.search(query_vec_faiss, K)
 
-    # distances 是余弦相似度（因为向量已归一化）
-    # indices 是知识库中的索引位置
+        # distances 是余弦相似度（因为向量已归一化）
+        # indices 是知识库中的索引位置
 
-    matched = []
-    for i, (dist, idx) in enumerate(zip(distances[0], indices[0])):
-        if idx == -1:
-            continue
-        sim = float(dist)  # dist 就是余弦相似度
-        logger.debug(f"🔍 知识块 {idx+1} 的注意力得分: {sim:.4f}")
-        if sim >= threshold:
-            matched.append(knowledge[idx])
-        else:
-            logger.debug(f"    ⏭️  知识块 {idx+1} 低于阈值 {threshold}，已跳过")
-        logger.info(f"检索完成:命中{len(matched)}条知识")
+        matched = []
+        for i, (dist, idx) in enumerate(zip(distances[0], indices[0])):
+            if idx == -1:
+                continue
+            sim = float(dist)  # dist 就是余弦相似度
+            logger.debug(f"🔍 知识块 {idx+1} 的注意力得分: {sim:.4f}")
+            if sim >= threshold:
+                matched.append(knowledge[idx])
+            else:
+                logger.debug(f"    ⏭️  知识块 {idx+1} 低于阈值 {threshold}，已跳过")
+
+    logger.info(f"检索完成:命中{len(matched)}条知识")
     return matched[:K]
 
 
@@ -318,7 +334,18 @@ def call_llm(prompt, mode, tools=None):
         "Content-Type": "application/json",
         "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
     }
-    response = requests.post(url, headers=headers, json=data, stream=use_stream)
+    # 设置连接与读取超时，避免 API 无响应时请求无限挂起、耗尽线程池
+    try:
+        response = requests.post(
+            url, headers=headers, json=data, stream=use_stream, timeout=(10, 120)
+        )
+        response.raise_for_status()
+    except requests.exceptions.Timeout:
+        logger.error("调用大模型超时")
+        return {"error": "调用大模型超时，请稍后重试"}
+    except requests.exceptions.RequestException as e:
+        logger.error(f"调用大模型失败: {e}")
+        return {"error": f"调用大模型失败: {e}"}
 
     if use_stream:
         full_content = ""
@@ -337,7 +364,11 @@ def call_llm(prompt, mode, tools=None):
                         continue
         return full_content
     else:
-        result = response.json()
+        try:
+            result = response.json()
+        except ValueError as e:
+            logger.error(f"大模型响应解析失败: {e}")
+            return {"error": "大模型响应格式异常"}
         return result
 
 
@@ -397,20 +428,35 @@ def rag_chat(message, history):
             return result["error"]
 
         # 检查是否是工具调用
-        if isinstance(result, dict) and "choices" in result:
+        if isinstance(result, dict) and "choices" in result and result["choices"]:
             choice = result["choices"][0]
-            message_obj = choice["message"]
+            message_obj = choice.get("message", {})
 
             if "tool_calls" in message_obj and message_obj["tool_calls"]:
                 tool_call = message_obj["tool_calls"][0]
-                tool_name = tool_call["function"]["name"]
-                tool_args = json.loads(tool_call["function"]["arguments"])
+                function_obj = tool_call.get("function", {})
+                tool_name = function_obj.get("name")
+
+                # 解析工具参数——LLM 输出不可信，需防御非法 JSON 与缺字段
+                try:
+                    tool_args = json.loads(function_obj.get("arguments", "{}"))
+                except (json.JSONDecodeError, TypeError):
+                    logger.error(f"工具参数解析失败: {function_obj.get('arguments')}")
+                    return "工具调用参数格式错误，请重试"
+
+                if not isinstance(tool_args, dict):
+                    logger.error(f"工具参数不是对象: {tool_args}")
+                    return "工具调用参数格式错误，请重试"
 
                 logger.info(f"🔧 模型请求调用工具: {tool_name}")
                 logger.info(f"📝 工具参数: {tool_args}")
 
                 if tool_name == "search_web":
-                    search_results = web_search_tavily(tool_args["query"])
+                    query = tool_args.get("query")
+                    if not query:
+                        logger.error("search_web 缺少 query 参数")
+                        return "搜索工具缺少 query 参数"
+                    search_results = web_search_tavily(query)
                     logger.info(f"搜索完成,返回{search_results}字符")
                     context["tool_results"].append(
                         {"tool": tool_name, "args": tool_args, "result": search_results}
@@ -422,7 +468,11 @@ def rag_chat(message, history):
                     }
                     continue
                 elif tool_name == "calculate":
-                    result = calculate(tool_args["expression"])
+                    expression = tool_args.get("expression")
+                    if not expression:
+                        logger.error("calculate 缺少 expression 参数")
+                        return "计算工具缺少 expression 参数"
+                    result = calculate(expression)
                     logger.info(f"计算结果:{result}")
                     context["tool_results"].append(
                         {"tool": tool_name, "args": tool_args, "result": result}
