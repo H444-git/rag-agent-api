@@ -6,6 +6,9 @@ load_dotenv()
 
 import requests
 import json
+import ast
+import operator
+import threading
 import numpy as np
 import fitz
 from text2vec import SentenceModel
@@ -145,28 +148,33 @@ def parse_file(filename, file_bytes):
 
 
 knowledge = load_knowledge("知识库简易版.txt", chunk_size=150)
-knowledge_vecs = model.encode(knowledge) if knowledge else []
 
 import faiss
 
+# 保护 knowledge 列表与 FAISS 索引的全局锁，避免并发读写导致索引损坏或数据不一致
+_knowledge_lock = threading.Lock()
+
 # 将知识向量转为 float32（FAISS 要求的数据类型）
-knowledge_vecs_faiss = np.array(knowledge_vecs).astype("float32")
-
-# 获取向量维度
-dim = knowledge_vecs_faiss.shape[1]
-
-# 创建 FAISS 索引（使用内积索引，配合归一化实现余弦相似度）
-index = faiss.IndexFlatIP(dim)  # IP = Inner Product（内积）
-# 归一化向量，使内积等于余弦相似度
-faiss.normalize_L2(knowledge_vecs_faiss)
-index.add(knowledge_vecs_faiss)
-
-print(f"✅ FAISS 索引已创建，包含 {index.ntotal} 条知识向量")
+if knowledge:
+    knowledge_vecs = model.encode(knowledge)
+    knowledge_vecs_faiss = np.array(knowledge_vecs).astype("float32")
+    dim = knowledge_vecs_faiss.shape[1]
+    # 归一化向量，使内积等于余弦相似度
+    faiss.normalize_L2(knowledge_vecs_faiss)
+    index = faiss.IndexFlatIP(dim)  # IP = Inner Product（内积）
+    index.add(knowledge_vecs_faiss)
+    print(f"✅ FAISS 索引已创建，包含 {index.ntotal} 条知识向量")
+else:
+    # 知识库为空时不创建索引，避免 np.array([]).shape[1] 崩溃；
+    # 首次调用 add_knowledge 时会按向量维度自动创建索引。
+    index = None
+    print("⚠️ 知识库为空，FAISS 索引将在首次添加知识时创建")
 
 
 def get_all_knowledge():
     """返回当前知识库里的所有文本块"""
-    return knowledge
+    with _knowledge_lock:
+        return list(knowledge)
 
 
 def add_knowledge(new_chunks):
@@ -174,18 +182,26 @@ def add_knowledge(new_chunks):
     向知识库追加新的文本块，并同步更新 FAISS 索引
     返回：新增的块数、当前总块数
     """
-    global knowledge
+    global knowledge, index
 
-    # 1. 向量化
+    if not new_chunks:
+        return 0, len(knowledge)
+
+    # 1. 向量化（不持锁，避免长时间阻塞检索）
     new_vecs = model.encode(new_chunks)
     new_vecs_faiss = np.array(new_vecs).astype("float32")
 
     # 2. 归一化（FAISS 要求）
     faiss.normalize_L2(new_vecs_faiss)
 
-    # 3. 追加到 knowledge 和 index，保证顺序一致
-    knowledge.extend(new_chunks)
-    index.add(new_vecs_faiss)
+    # 3. 先更新索引再追加文本：若 index.add 失败，knowledge 不会被污染，
+    #    保证 knowledge 与 index 始终一一对应。
+    with _knowledge_lock:
+        if index is None:
+            dim = new_vecs_faiss.shape[1]
+            index = faiss.IndexFlatIP(dim)
+        index.add(new_vecs_faiss)
+        knowledge.extend(new_chunks)
 
     # 打印新增的每一块内容
     for i, chunk in enumerate(new_chunks):
@@ -204,23 +220,26 @@ def search_mostk(query_vec, K=16, threshold=0.4):
     query_vec_faiss = np.array([query_vec]).astype("float32")
     faiss.normalize_L2(query_vec_faiss)
 
-    # FAISS 检索
-    distances, indices = index.search(query_vec_faiss, K)
+    # FAISS 检索与 knowledge 读取需在同一把锁内，保证索引与文本对齐
+    with _knowledge_lock:
+        if index is None or index.ntotal == 0:
+            return []
+        distances, indices = index.search(query_vec_faiss, K)
 
-    # distances 是余弦相似度（因为向量已归一化）
-    # indices 是知识库中的索引位置
+        # distances 是余弦相似度（因为向量已归一化）
+        # indices 是知识库中的索引位置
+        matched = []
+        for i, (dist, idx) in enumerate(zip(distances[0], indices[0])):
+            if idx == -1:
+                continue
+            sim = float(dist)  # dist 就是余弦相似度
+            logger.debug(f"🔍 知识块 {idx+1} 的注意力得分: {sim:.4f}")
+            if sim >= threshold:
+                matched.append(knowledge[idx])
+            else:
+                logger.debug(f"    ⏭️  知识块 {idx+1} 低于阈值 {threshold}，已跳过")
 
-    matched = []
-    for i, (dist, idx) in enumerate(zip(distances[0], indices[0])):
-        if idx == -1:
-            continue
-        sim = float(dist)  # dist 就是余弦相似度
-        logger.debug(f"🔍 知识块 {idx+1} 的注意力得分: {sim:.4f}")
-        if sim >= threshold:
-            matched.append(knowledge[idx])
-        else:
-            logger.debug(f"    ⏭️  知识块 {idx+1} 低于阈值 {threshold}，已跳过")
-        logger.info(f"检索完成:命中{len(matched)}条知识")
+    logger.info(f"检索完成:命中{len(matched)}条知识")
     return matched[:K]
 
 
@@ -264,7 +283,7 @@ def web_search_tavily(query):
 
 def calculate(expression):
     """
-    安全地计算数学表达式
+    安全地计算数学表达式（不使用 eval，避免代码注入和资源耗尽）
     """
     # 只允许数字、运算符、括号、空格
     allowed_chars = set("0123456789+-*/().% ")
@@ -272,10 +291,51 @@ def calculate(expression):
         return "错误：表达式包含不支持的字符"
 
     try:
-        # 使用 eval 计算，但限制全局和局部命名空间为空，避免执行危险代码
-        result = eval(expression, {"__builtins__": {}}, {})
+        tree = ast.parse(expression, mode="eval")
+    except SyntaxError as e:
+        return f"计算错误：语法错误 - {str(e)}"
+
+    safe_ops = {
+        ast.Add: operator.add,
+        ast.Sub: operator.sub,
+        ast.Mult: operator.mul,
+        ast.Div: operator.truediv,
+        ast.Mod: operator.mod,
+        ast.Pow: operator.pow,
+        ast.USub: operator.neg,
+        ast.UAdd: operator.pos,
+    }
+
+    def _eval(node):
+        if isinstance(node, ast.Expression):
+            return _eval(node.body)
+        if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
+            return node.value
+        if isinstance(node, ast.BinOp):
+            op_type = type(node.op)
+            if op_type not in safe_ops:
+                raise ValueError(f"不支持的运算符: {op_type.__name__}")
+            left = _eval(node.left)
+            right = _eval(node.right)
+            # 限制幂运算的操作数，防止 9**9**9 之类的巨大数耗尽资源
+            if op_type == ast.Pow:
+                if abs(right) > 1000 or abs(left) > 100000:
+                    raise ValueError("幂运算数值过大，已拒绝执行")
+            result = safe_ops[op_type](left, right)
+            if isinstance(result, (int, float)) and abs(result) > 1e15:
+                raise ValueError("计算结果过大，已拒绝执行")
+            return result
+        if isinstance(node, ast.UnaryOp):
+            op_type = type(node.op)
+            if op_type not in safe_ops:
+                raise ValueError(f"不支持的运算符: {op_type.__name__}")
+            return safe_ops[op_type](_eval(node.operand))
+        raise ValueError(f"不支持的表达式元素: {type(node).__name__}")
+
+    try:
+        result = _eval(tree)
         return f"计算结果：{expression} = {result}"
-    except Exception as e:
+    except (ValueError, ZeroDivisionError, OverflowError, TypeError) as e:
         return f"计算错误：{str(e)}"
 
 
@@ -343,7 +403,7 @@ def call_llm(prompt, mode, tools=None):
 
 def rag_chat(message, history):
     logger.info(f"收到问题:{message}")
-    if not knowledge:
+    if not get_all_knowledge():
         logger.warning("知识库为空")
         return "知识库为空，请检查 知识库简易版.txt 文件"
 
@@ -404,13 +464,20 @@ def rag_chat(message, history):
             if "tool_calls" in message_obj and message_obj["tool_calls"]:
                 tool_call = message_obj["tool_calls"][0]
                 tool_name = tool_call["function"]["name"]
-                tool_args = json.loads(tool_call["function"]["arguments"])
+                try:
+                    tool_args = json.loads(tool_call["function"]["arguments"])
+                except (json.JSONDecodeError, TypeError) as e:
+                    logger.error(f"工具参数解析失败: {e}")
+                    return "工具参数解析失败，请重试"
 
                 logger.info(f"🔧 模型请求调用工具: {tool_name}")
                 logger.info(f"📝 工具参数: {tool_args}")
 
                 if tool_name == "search_web":
-                    search_results = web_search_tavily(tool_args["query"])
+                    search_query = tool_args.get("query")
+                    if not search_query:
+                        return "search_web 工具缺少 query 参数"
+                    search_results = web_search_tavily(search_query)
                     logger.info(f"搜索完成,返回{search_results}字符")
                     context["tool_results"].append(
                         {"tool": tool_name, "args": tool_args, "result": search_results}
@@ -422,7 +489,10 @@ def rag_chat(message, history):
                     }
                     continue
                 elif tool_name == "calculate":
-                    result = calculate(tool_args["expression"])
+                    expression = tool_args.get("expression")
+                    if not expression:
+                        return "calculate 工具缺少 expression 参数"
+                    result = calculate(expression)
                     logger.info(f"计算结果:{result}")
                     context["tool_results"].append(
                         {"tool": tool_name, "args": tool_args, "result": result}
