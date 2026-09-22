@@ -1,4 +1,5 @@
 import os
+import threading
 
 from dotenv import load_dotenv
 
@@ -145,28 +146,40 @@ def parse_file(filename, file_bytes):
 
 
 knowledge = load_knowledge("知识库简易版.txt", chunk_size=150)
-knowledge_vecs = model.encode(knowledge) if knowledge else []
 
 import faiss
 
-# 将知识向量转为 float32（FAISS 要求的数据类型）
-knowledge_vecs_faiss = np.array(knowledge_vecs).astype("float32")
-
-# 获取向量维度
-dim = knowledge_vecs_faiss.shape[1]
+if knowledge:
+    knowledge_vecs = model.encode(knowledge)
+    knowledge_vecs_faiss = np.array(knowledge_vecs).astype("float32")
+    dim = knowledge_vecs_faiss.shape[1]
+else:
+    # 知识库为空时，无法从已有向量推断维度。
+    # 通过一次占位编码获取模型的向量维度，以创建空的 FAISS 索引，
+    # 避免 np.array([]).shape[1] 抛出 IndexError 导致应用启动崩溃。
+    dim = model.encode(["占位"]).shape[1]
+    knowledge_vecs_faiss = np.empty((0, dim), dtype="float32")
 
 # 创建 FAISS 索引（使用内积索引，配合归一化实现余弦相似度）
 index = faiss.IndexFlatIP(dim)  # IP = Inner Product（内积）
 # 归一化向量，使内积等于余弦相似度
-faiss.normalize_L2(knowledge_vecs_faiss)
-index.add(knowledge_vecs_faiss)
+if knowledge_vecs_faiss.shape[0] > 0:
+    faiss.normalize_L2(knowledge_vecs_faiss)
+    index.add(knowledge_vecs_faiss)
 
 print(f"✅ FAISS 索引已创建，包含 {index.ntotal} 条知识向量")
+
+# 保护共享状态（knowledge 列表与 FAISS index）的锁。
+# /chat（同步端点，运行在线程池中）会读取 index/knowledge，
+# /upload（异步端点）会写入 index/knowledge，二者可能并发执行，
+# FAISS 索引不支持并发读写，必须加锁。
+_knowledge_lock = threading.RLock()
 
 
 def get_all_knowledge():
     """返回当前知识库里的所有文本块"""
-    return knowledge
+    with _knowledge_lock:
+        return list(knowledge)
 
 
 def add_knowledge(new_chunks):
@@ -183,9 +196,10 @@ def add_knowledge(new_chunks):
     # 2. 归一化（FAISS 要求）
     faiss.normalize_L2(new_vecs_faiss)
 
-    # 3. 追加到 knowledge 和 index，保证顺序一致
-    knowledge.extend(new_chunks)
-    index.add(new_vecs_faiss)
+    # 3. 追加到 knowledge 和 index，保证顺序一致（加锁防止与检索并发）
+    with _knowledge_lock:
+        knowledge.extend(new_chunks)
+        index.add(new_vecs_faiss)
 
     # 打印新增的每一块内容
     for i, chunk in enumerate(new_chunks):
@@ -204,23 +218,21 @@ def search_mostk(query_vec, K=16, threshold=0.4):
     query_vec_faiss = np.array([query_vec]).astype("float32")
     faiss.normalize_L2(query_vec_faiss)
 
-    # FAISS 检索
-    distances, indices = index.search(query_vec_faiss, K)
-
-    # distances 是余弦相似度（因为向量已归一化）
-    # indices 是知识库中的索引位置
-
-    matched = []
-    for i, (dist, idx) in enumerate(zip(distances[0], indices[0])):
-        if idx == -1:
-            continue
-        sim = float(dist)  # dist 就是余弦相似度
-        logger.debug(f"🔍 知识块 {idx+1} 的注意力得分: {sim:.4f}")
-        if sim >= threshold:
-            matched.append(knowledge[idx])
-        else:
-            logger.debug(f"    ⏭️  知识块 {idx+1} 低于阈值 {threshold}，已跳过")
-        logger.info(f"检索完成:命中{len(matched)}条知识")
+    # FAISS 检索（加锁：防止与 add_knowledge 的 index.add 并发导致崩溃）
+    with _knowledge_lock:
+        distances, indices = index.search(query_vec_faiss, K)
+        # 在锁内读取 knowledge，避免索引与文本错位
+        matched = []
+        for i, (dist, idx) in enumerate(zip(distances[0], indices[0])):
+            if idx == -1:
+                continue
+            sim = float(dist)  # dist 就是余弦相似度
+            logger.debug(f"🔍 知识块 {idx+1} 的注意力得分: {sim:.4f}")
+            if sim >= threshold:
+                matched.append(knowledge[idx])
+            else:
+                logger.debug(f"    ⏭️  知识块 {idx+1} 低于阈值 {threshold}，已跳过")
+            logger.info(f"检索完成:命中{len(matched)}条知识")
     return matched[:K]
 
 
@@ -404,7 +416,13 @@ def rag_chat(message, history):
             if "tool_calls" in message_obj and message_obj["tool_calls"]:
                 tool_call = message_obj["tool_calls"][0]
                 tool_name = tool_call["function"]["name"]
-                tool_args = json.loads(tool_call["function"]["arguments"])
+                try:
+                    tool_args = json.loads(tool_call["function"]["arguments"])
+                except (json.JSONDecodeError, TypeError) as e:
+                    logger.error(
+                        f"模型返回的工具参数不是合法 JSON: {tool_call['function'].get('arguments')!r}, 错误: {e}"
+                    )
+                    return "模型返回的工具调用参数格式错误，请重试。"
 
                 logger.info(f"🔧 模型请求调用工具: {tool_name}")
                 logger.info(f"📝 工具参数: {tool_args}")
