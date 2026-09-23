@@ -6,6 +6,7 @@ load_dotenv()
 
 import requests
 import json
+import threading
 import numpy as np
 import fitz
 from text2vec import SentenceModel
@@ -113,11 +114,14 @@ def load_knowledge(file_path, chunk_size=100):
 def parse_pdf(file_bytes):
     """解析 PDF 字节流，返回纯文本"""
     doc = fitz.open(stream=file_bytes, filetype="pdf")
-    text = ""
-    for page in doc:
-        text += page.get_text()
-    doc.close()
-    return text
+    try:
+        text = ""
+        for page in doc:
+            text += page.get_text()
+        return text
+    finally:
+        # 即使某页解析抛出异常，也要释放 fitz 文档占用的内存，避免泄漏
+        doc.close()
 
 
 def parse_docx(file_bytes):
@@ -149,24 +153,36 @@ knowledge_vecs = model.encode(knowledge) if knowledge else []
 
 import faiss
 
-# 将知识向量转为 float32（FAISS 要求的数据类型）
-knowledge_vecs_faiss = np.array(knowledge_vecs).astype("float32")
+# 保护知识库为空时的启动：避免 np.array([]).shape[1] 抛出 IndexError 导致应用无法启动
+if knowledge:
+    # 将知识向量转为 float32（FAISS 要求的数据类型）
+    knowledge_vecs_faiss = np.array(knowledge_vecs).astype("float32")
 
-# 获取向量维度
-dim = knowledge_vecs_faiss.shape[1]
+    # 获取向量维度
+    dim = knowledge_vecs_faiss.shape[1]
 
-# 创建 FAISS 索引（使用内积索引，配合归一化实现余弦相似度）
-index = faiss.IndexFlatIP(dim)  # IP = Inner Product（内积）
-# 归一化向量，使内积等于余弦相似度
-faiss.normalize_L2(knowledge_vecs_faiss)
-index.add(knowledge_vecs_faiss)
+    # 创建 FAISS 索引（使用内积索引，配合归一化实现余弦相似度）
+    index = faiss.IndexFlatIP(dim)  # IP = Inner Product（内积）
+    # 归一化向量，使内积等于余弦相似度
+    faiss.normalize_L2(knowledge_vecs_faiss)
+    index.add(knowledge_vecs_faiss)
 
-print(f"✅ FAISS 索引已创建，包含 {index.ntotal} 条知识向量")
+    print(f"✅ FAISS 索引已创建，包含 {index.ntotal} 条知识向量")
+else:
+    # 知识库为空时不创建索引，后续 add_knowledge 会按需创建
+    index = None
+    print("⚠️ 知识库为空，FAISS 索引将在首次添加知识时创建")
+
+# 保护共享状态（knowledge 列表与 FAISS index）的并发访问锁
+# FastAPI 同步端点在线程池中执行，/upload 的写入与 /chat 的检索可能并发，
+# FAISS index 的 add/search 不是线程安全的，必须加锁避免索引损坏或检索错乱。
+_knowledge_lock = threading.Lock()
 
 
 def get_all_knowledge():
     """返回当前知识库里的所有文本块"""
-    return knowledge
+    with _knowledge_lock:
+        return list(knowledge)
 
 
 def add_knowledge(new_chunks):
@@ -174,7 +190,10 @@ def add_knowledge(new_chunks):
     向知识库追加新的文本块，并同步更新 FAISS 索引
     返回：新增的块数、当前总块数
     """
-    global knowledge
+    global knowledge, index
+
+    if not new_chunks:
+        return 0, len(knowledge)
 
     # 1. 向量化
     new_vecs = model.encode(new_chunks)
@@ -183,9 +202,15 @@ def add_knowledge(new_chunks):
     # 2. 归一化（FAISS 要求）
     faiss.normalize_L2(new_vecs_faiss)
 
-    # 3. 追加到 knowledge 和 index，保证顺序一致
-    knowledge.extend(new_chunks)
-    index.add(new_vecs_faiss)
+    # 3. 追加到 index 和 knowledge，保证顺序一致且并发安全
+    # 先 index.add 再 knowledge.extend：list.extend 不会失败，
+    # 因此若 index.add 抛异常，knowledge 不会被修改，避免索引与列表永久错位。
+    with _knowledge_lock:
+        if index is None:
+            dim = new_vecs_faiss.shape[1]
+            index = faiss.IndexFlatIP(dim)
+        index.add(new_vecs_faiss)
+        knowledge.extend(new_chunks)
 
     # 打印新增的每一块内容
     for i, chunk in enumerate(new_chunks):
@@ -200,27 +225,34 @@ def search_mostk(query_vec, K=16, threshold=0.4):
     """
     使用 FAISS 检索最相关的 K 条知识
     """
+    # 知识库/索引尚未初始化时直接返回空
+    if index is None:
+        return []
+
     # 将查询向量转为 float32 并归一化
     query_vec_faiss = np.array([query_vec]).astype("float32")
     faiss.normalize_L2(query_vec_faiss)
 
-    # FAISS 检索
-    distances, indices = index.search(query_vec_faiss, K)
+    # FAISS 检索与 knowledge 列表读取必须在同一把锁内，
+    # 避免与 add_knowledge 的写入并发导致索引损坏或返回错位的知识块。
+    with _knowledge_lock:
+        distances, indices = index.search(query_vec_faiss, K)
 
-    # distances 是余弦相似度（因为向量已归一化）
-    # indices 是知识库中的索引位置
+        # distances 是余弦相似度（因为向量已归一化）
+        # indices 是知识库中的索引位置
 
-    matched = []
-    for i, (dist, idx) in enumerate(zip(distances[0], indices[0])):
-        if idx == -1:
-            continue
-        sim = float(dist)  # dist 就是余弦相似度
-        logger.debug(f"🔍 知识块 {idx+1} 的注意力得分: {sim:.4f}")
-        if sim >= threshold:
-            matched.append(knowledge[idx])
-        else:
-            logger.debug(f"    ⏭️  知识块 {idx+1} 低于阈值 {threshold}，已跳过")
-        logger.info(f"检索完成:命中{len(matched)}条知识")
+        matched = []
+        for dist, idx in zip(distances[0], indices[0]):
+            if idx == -1:
+                continue
+            sim = float(dist)  # dist 就是余弦相似度
+            logger.debug(f"🔍 知识块 {idx+1} 的注意力得分: {sim:.4f}")
+            if sim >= threshold:
+                matched.append(knowledge[idx])
+            else:
+                logger.debug(f"    ⏭️  知识块 {idx+1} 低于阈值 {threshold}，已跳过")
+
+    logger.info(f"检索完成:命中{len(matched)}条知识")
     return matched[:K]
 
 
@@ -266,10 +298,17 @@ def calculate(expression):
     """
     安全地计算数学表达式
     """
+    # 限制表达式长度，防止超长表达式消耗资源
+    if len(expression) > 100:
+        return "错误：表达式过长"
     # 只允许数字、运算符、括号、空格
     allowed_chars = set("0123456789+-*/().% ")
     if not all(c in allowed_chars for c in expression):
         return "错误：表达式包含不支持的字符"
+    # 禁止幂运算（**）：即使 __builtins__ 为空，eval 仍会计算 9**9**9 这类
+    # 超大整数，导致 CPU/内存耗尽（DoS）。乘法由单个 * 提供，足够常用计算。
+    if "**" in expression:
+        return "错误：不支持幂运算"
 
     try:
         # 使用 eval 计算，但限制全局和局部命名空间为空，避免执行危险代码
@@ -404,7 +443,11 @@ def rag_chat(message, history):
             if "tool_calls" in message_obj and message_obj["tool_calls"]:
                 tool_call = message_obj["tool_calls"][0]
                 tool_name = tool_call["function"]["name"]
-                tool_args = json.loads(tool_call["function"]["arguments"])
+                try:
+                    tool_args = json.loads(tool_call["function"]["arguments"])
+                except (json.JSONDecodeError, TypeError):
+                    logger.error(f"工具参数解析失败: {tool_call['function'].get('arguments')}")
+                    return "工具调用参数格式错误，请重试"
 
                 logger.info(f"🔧 模型请求调用工具: {tool_name}")
                 logger.info(f"📝 工具参数: {tool_args}")

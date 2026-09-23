@@ -7,6 +7,9 @@ from logger_utils import logger
 
 app = FastAPI()
 
+# 限制上传文件大小，防止超大文件耗尽内存（DoS）
+MAX_UPLOAD_BYTES = 10 * 1024 * 1024  # 10MB
+
 
 class ChatRequest(BaseModel):
     question: str
@@ -29,7 +32,19 @@ def chat(request: ChatRequest):
 @app.post("/upload")
 async def upload(file: UploadFile = File(...)):
     try:
-        file_bytes = await file.read()
+        # 分块读取并限制大小，避免一次性将超大文件读入内存
+        file_bytes = b""
+        while True:
+            chunk = await file.read(64 * 1024)
+            if not chunk:
+                break
+            file_bytes += chunk
+            if len(file_bytes) > MAX_UPLOAD_BYTES:
+                return {
+                    "message": "上传失败",
+                    "error": f"文件过大，最大支持 {MAX_UPLOAD_BYTES // 1024 // 1024}MB",
+                }
+
         text = parse_file(file.filename, file_bytes)
         chunks = split_document(text, chunk_size=400)
 
@@ -43,7 +58,7 @@ async def upload(file: UploadFile = File(...)):
         }
 
     except Exception as e:
-        logger.error("文件上传失败:{e}")
+        logger.error(f"文件上传失败:{e}")
         return {"message": "上传失败", "error": str(e)}
 
 
