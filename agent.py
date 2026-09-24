@@ -1,4 +1,5 @@
 import os
+import threading
 
 from dotenv import load_dotenv
 
@@ -153,13 +154,26 @@ import faiss
 knowledge_vecs_faiss = np.array(knowledge_vecs).astype("float32")
 
 # 获取向量维度
-dim = knowledge_vecs_faiss.shape[1]
+# 修复：知识库为空时 np.array([]) 是 1 维数组，访问 shape[1] 会抛
+# IndexError 导致服务启动崩溃。此时用占位句子从模型获取向量维度，
+# 创建空索引，保证服务可正常启动（知识库为空时由 rag_chat 兜底返回提示）。
+if knowledge_vecs_faiss.ndim == 2 and knowledge_vecs_faiss.shape[0] > 0:
+    dim = knowledge_vecs_faiss.shape[1]
+    faiss.normalize_L2(knowledge_vecs_faiss)
+else:
+    logger.warning("知识库为空，创建空 FAISS 索引；请检查 知识库简易版.txt 是否存在")
+    dim = model.encode(["__placeholder__"]).shape[1]
 
 # 创建 FAISS 索引（使用内积索引，配合归一化实现余弦相似度）
 index = faiss.IndexFlatIP(dim)  # IP = Inner Product（内积）
 # 归一化向量，使内积等于余弦相似度
-faiss.normalize_L2(knowledge_vecs_faiss)
-index.add(knowledge_vecs_faiss)
+if knowledge_vecs_faiss.ndim == 2 and knowledge_vecs_faiss.shape[0] > 0:
+    index.add(knowledge_vecs_faiss)
+
+# 保护 FAISS 索引的并发访问：/upload（async，事件循环线程）写入与
+# /chat（sync，线程池线程）读取会真正并发，而 FAISS 不支持并发读写
+# （IndexFlat 在 add 触发 reallocation 时与并发 search 可能段错误）。
+_faiss_lock = threading.Lock()
 
 print(f"✅ FAISS 索引已创建，包含 {index.ntotal} 条知识向量")
 
@@ -184,8 +198,11 @@ def add_knowledge(new_chunks):
     faiss.normalize_L2(new_vecs_faiss)
 
     # 3. 追加到 knowledge 和 index，保证顺序一致
-    knowledge.extend(new_chunks)
-    index.add(new_vecs_faiss)
+    # 修复：FAISS 不支持并发读写，与 search_mostk 的检索互斥，避免
+    # add 期间触发 reallocation 导致段错误或索引/列表状态不一致。
+    with _faiss_lock:
+        knowledge.extend(new_chunks)
+        index.add(new_vecs_faiss)
 
     # 打印新增的每一块内容
     for i, chunk in enumerate(new_chunks):
@@ -205,22 +222,25 @@ def search_mostk(query_vec, K=16, threshold=0.4):
     faiss.normalize_L2(query_vec_faiss)
 
     # FAISS 检索
-    distances, indices = index.search(query_vec_faiss, K)
+    # 修复：检索与 add_knowledge 的写入互斥，避免 FAISS 并发读写段错误，
+    # 同时保证 search 返回的 idx 在读取 knowledge 时仍然有效。
+    with _faiss_lock:
+        distances, indices = index.search(query_vec_faiss, K)
 
-    # distances 是余弦相似度（因为向量已归一化）
-    # indices 是知识库中的索引位置
+        # distances 是余弦相似度（因为向量已归一化）
+        # indices 是知识库中的索引位置
 
-    matched = []
-    for i, (dist, idx) in enumerate(zip(distances[0], indices[0])):
-        if idx == -1:
-            continue
-        sim = float(dist)  # dist 就是余弦相似度
-        logger.debug(f"🔍 知识块 {idx+1} 的注意力得分: {sim:.4f}")
-        if sim >= threshold:
-            matched.append(knowledge[idx])
-        else:
-            logger.debug(f"    ⏭️  知识块 {idx+1} 低于阈值 {threshold}，已跳过")
-        logger.info(f"检索完成:命中{len(matched)}条知识")
+        matched = []
+        for i, (dist, idx) in enumerate(zip(distances[0], indices[0])):
+            if idx == -1:
+                continue
+            sim = float(dist)  # dist 就是余弦相似度
+            logger.debug(f"🔍 知识块 {idx+1} 的注意力得分: {sim:.4f}")
+            if sim >= threshold:
+                matched.append(knowledge[idx])
+            else:
+                logger.debug(f"    ⏭️  知识块 {idx+1} 低于阈值 {threshold}，已跳过")
+            logger.info(f"检索完成:命中{len(matched)}条知识")
     return matched[:K]
 
 
@@ -319,6 +339,17 @@ def call_llm(prompt, mode, tools=None):
         "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
     }
     response = requests.post(url, headers=headers, json=data, stream=use_stream)
+
+    # 修复：DeepSeek 返回非 200（限流 429、网关 5xx 等）时响应体可能不是 JSON，
+    # 直接 response.json() 会抛 JSONDecodeError，导致 /chat 接口 500 崩溃。
+    # 统一在此处返回错误 dict，由 rag_chat 转为对用户友好的回答。
+    if response.status_code != 200:
+        try:
+            err_payload = response.json()
+        except Exception:
+            err_payload = (response.text or "")[:200] or "(空响应体)"
+        logger.error(f"LLM 调用失败: HTTP {response.status_code} {err_payload}")
+        return {"error": f"LLM 调用失败: HTTP {response.status_code}"}
 
     if use_stream:
         full_content = ""
