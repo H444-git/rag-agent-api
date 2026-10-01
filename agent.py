@@ -1,4 +1,5 @@
 import os
+import threading
 
 from dotenv import load_dotenv
 
@@ -144,29 +145,44 @@ def parse_file(filename, file_bytes):
         raise ValueError(f"不支持的文件类型：{filename}")
 
 
+import faiss
+
+# 保护 knowledge 列表与 FAISS 索引的并发一致性：写（add_knowledge）与读（search_mostk）必须串行
+_knowledge_lock = threading.Lock()
+
 knowledge = load_knowledge("知识库简易版.txt", chunk_size=150)
 knowledge_vecs = model.encode(knowledge) if knowledge else []
 
-import faiss
-
 # 将知识向量转为 float32（FAISS 要求的数据类型）
-knowledge_vecs_faiss = np.array(knowledge_vecs).astype("float32")
+knowledge_vecs_faiss = (
+    np.array(knowledge_vecs, dtype="float32")
+    if knowledge_vecs
+    else np.empty((0, 0), dtype="float32")
+)
 
-# 获取向量维度
-dim = knowledge_vecs_faiss.shape[1]
+# 获取向量维度并创建 FAISS 索引（使用内积索引，配合归一化实现余弦相似度）
+# 空知识库时用占位向量推断维度，避免 shape[1] IndexError 导致服务无法启动
+if knowledge_vecs_faiss.size > 0:
+    dim = knowledge_vecs_faiss.shape[1]
+else:
+    logger.warning("知识库为空，使用占位向量初始化 FAISS 索引")
+    placeholder = model.encode(["占位"]).astype("float32")
+    dim = placeholder.shape[1]
 
-# 创建 FAISS 索引（使用内积索引，配合归一化实现余弦相似度）
 index = faiss.IndexFlatIP(dim)  # IP = Inner Product（内积）
-# 归一化向量，使内积等于余弦相似度
-faiss.normalize_L2(knowledge_vecs_faiss)
-index.add(knowledge_vecs_faiss)
+
+if knowledge_vecs_faiss.size > 0:
+    # 归一化向量，使内积等于余弦相似度
+    faiss.normalize_L2(knowledge_vecs_faiss)
+    index.add(knowledge_vecs_faiss)
 
 print(f"✅ FAISS 索引已创建，包含 {index.ntotal} 条知识向量")
 
 
 def get_all_knowledge():
     """返回当前知识库里的所有文本块"""
-    return knowledge
+    with _knowledge_lock:
+        return list(knowledge)
 
 
 def add_knowledge(new_chunks):
@@ -174,26 +190,28 @@ def add_knowledge(new_chunks):
     向知识库追加新的文本块，并同步更新 FAISS 索引
     返回：新增的块数、当前总块数
     """
-    global knowledge
+    if not new_chunks:
+        return 0, len(knowledge)
 
-    # 1. 向量化
+    # 1. 向量化（模型 encode 线程安全，放锁外减少持锁时间）
     new_vecs = model.encode(new_chunks)
     new_vecs_faiss = np.array(new_vecs).astype("float32")
 
     # 2. 归一化（FAISS 要求）
     faiss.normalize_L2(new_vecs_faiss)
 
-    # 3. 追加到 knowledge 和 index，保证顺序一致
-    knowledge.extend(new_chunks)
-    index.add(new_vecs_faiss)
+    # 3. 加锁原子更新 knowledge 与 index，确保二者始终等长、顺序一致
+    with _knowledge_lock:
+        knowledge.extend(new_chunks)
+        index.add(new_vecs_faiss)
 
-    # 打印新增的每一块内容
-    for i, chunk in enumerate(new_chunks):
-        logger.info(f"新增块 {i+1}: {chunk}...")
+        # 打印新增的每一块内容
+        for i, chunk in enumerate(new_chunks):
+            logger.info(f"新增块 {i+1}: {chunk}...")
 
-    logger.info(f"知识库更新：新增 {len(new_chunks)} 块，当前共 {len(knowledge)} 块")
+        logger.info(f"知识库更新：新增 {len(new_chunks)} 块，当前共 {len(knowledge)} 块")
 
-    return len(new_chunks), len(knowledge)
+        return len(new_chunks), len(knowledge)
 
 
 def search_mostk(query_vec, K=16, threshold=0.4):
@@ -204,23 +222,29 @@ def search_mostk(query_vec, K=16, threshold=0.4):
     query_vec_faiss = np.array([query_vec]).astype("float32")
     faiss.normalize_L2(query_vec_faiss)
 
-    # FAISS 检索
-    distances, indices = index.search(query_vec_faiss, K)
-
-    # distances 是余弦相似度（因为向量已归一化）
-    # indices 是知识库中的索引位置
+    # FAISS 检索 + knowledge 访问必须在同一把锁内，避免 index.search 返回的 idx 越界
+    with _knowledge_lock:
+        if index.ntotal == 0:
+            return []
+        # FAISS 检索
+        distances, indices = index.search(query_vec_faiss, min(K, index.ntotal))
+        # 在锁内拷贝 knowledge 切片，后续打印日志不再需要持锁
+        snapshot = list(knowledge)
 
     matched = []
-    for i, (dist, idx) in enumerate(zip(distances[0], indices[0])):
+    for dist, idx in zip(distances[0], indices[0]):
         if idx == -1:
             continue
         sim = float(dist)  # dist 就是余弦相似度
+        if idx >= len(snapshot):
+            logger.error(f"检索索引越界 idx={idx}, snapshot_len={len(snapshot)}, 已跳过")
+            continue
         logger.debug(f"🔍 知识块 {idx+1} 的注意力得分: {sim:.4f}")
         if sim >= threshold:
-            matched.append(knowledge[idx])
+            matched.append(snapshot[idx])
         else:
             logger.debug(f"    ⏭️  知识块 {idx+1} 低于阈值 {threshold}，已跳过")
-        logger.info(f"检索完成:命中{len(matched)}条知识")
+    logger.info(f"检索完成:命中{len(matched)}条知识")
     return matched[:K]
 
 
