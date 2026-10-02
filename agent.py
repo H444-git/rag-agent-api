@@ -6,6 +6,7 @@ load_dotenv()
 
 import requests
 import json
+import threading
 import numpy as np
 import fitz
 from text2vec import SentenceModel
@@ -149,19 +150,27 @@ knowledge_vecs = model.encode(knowledge) if knowledge else []
 
 import faiss
 
-# 将知识向量转为 float32（FAISS 要求的数据类型）
-knowledge_vecs_faiss = np.array(knowledge_vecs).astype("float32")
+if knowledge_vecs:
+    # 将知识向量转为 float32（FAISS 要求的数据类型）
+    knowledge_vecs_faiss = np.array(knowledge_vecs).astype("float32")
 
-# 获取向量维度
-dim = knowledge_vecs_faiss.shape[1]
+    # 获取向量维度
+    dim = knowledge_vecs_faiss.shape[1]
 
-# 创建 FAISS 索引（使用内积索引，配合归一化实现余弦相似度）
-index = faiss.IndexFlatIP(dim)  # IP = Inner Product（内积）
-# 归一化向量，使内积等于余弦相似度
-faiss.normalize_L2(knowledge_vecs_faiss)
-index.add(knowledge_vecs_faiss)
+    # 创建 FAISS 索引（使用内积索引，配合归一化实现余弦相似度）
+    index = faiss.IndexFlatIP(dim)  # IP = Inner Product（内积）
+    # 归一化向量，使内积等于余弦相似度
+    faiss.normalize_L2(knowledge_vecs_faiss)
+    index.add(knowledge_vecs_faiss)
+else:
+    # 知识库为空时，通过编码空文本推断向量维度，创建空索引
+    dim = model.encode([""]).shape[1]
+    index = faiss.IndexFlatIP(dim)
 
 print(f"✅ FAISS 索引已创建，包含 {index.ntotal} 条知识向量")
+
+# 保护 knowledge 列表与 FAISS index 的并发读写
+_knowledge_lock = threading.Lock()
 
 
 def get_all_knowledge():
@@ -176,7 +185,7 @@ def add_knowledge(new_chunks):
     """
     global knowledge
 
-    # 1. 向量化
+    # 1. 向量化（CPU 密集，放在锁外避免阻塞）
     new_vecs = model.encode(new_chunks)
     new_vecs_faiss = np.array(new_vecs).astype("float32")
 
@@ -184,8 +193,9 @@ def add_knowledge(new_chunks):
     faiss.normalize_L2(new_vecs_faiss)
 
     # 3. 追加到 knowledge 和 index，保证顺序一致
-    knowledge.extend(new_chunks)
-    index.add(new_vecs_faiss)
+    with _knowledge_lock:
+        knowledge.extend(new_chunks)
+        index.add(new_vecs_faiss)
 
     # 打印新增的每一块内容
     for i, chunk in enumerate(new_chunks):
@@ -204,23 +214,24 @@ def search_mostk(query_vec, K=16, threshold=0.4):
     query_vec_faiss = np.array([query_vec]).astype("float32")
     faiss.normalize_L2(query_vec_faiss)
 
-    # FAISS 检索
-    distances, indices = index.search(query_vec_faiss, K)
+    # FAISS 检索与 knowledge 读取加锁，避免与 add_knowledge 并发产生竞态
+    with _knowledge_lock:
+        distances, indices = index.search(query_vec_faiss, K)
 
-    # distances 是余弦相似度（因为向量已归一化）
-    # indices 是知识库中的索引位置
+        # distances 是余弦相似度（因为向量已归一化）
+        # indices 是知识库中的索引位置
 
-    matched = []
-    for i, (dist, idx) in enumerate(zip(distances[0], indices[0])):
-        if idx == -1:
-            continue
-        sim = float(dist)  # dist 就是余弦相似度
-        logger.debug(f"🔍 知识块 {idx+1} 的注意力得分: {sim:.4f}")
-        if sim >= threshold:
-            matched.append(knowledge[idx])
-        else:
-            logger.debug(f"    ⏭️  知识块 {idx+1} 低于阈值 {threshold}，已跳过")
-        logger.info(f"检索完成:命中{len(matched)}条知识")
+        matched = []
+        for i, (dist, idx) in enumerate(zip(distances[0], indices[0])):
+            if idx == -1:
+                continue
+            sim = float(dist)  # dist 就是余弦相似度
+            logger.debug(f"🔍 知识块 {idx+1} 的注意力得分: {sim:.4f}")
+            if sim >= threshold:
+                matched.append(knowledge[idx])
+            else:
+                logger.debug(f"    ⏭️  知识块 {idx+1} 低于阈值 {threshold}，已跳过")
+            logger.info(f"检索完成:命中{len(matched)}条知识")
     return matched[:K]
 
 

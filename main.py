@@ -1,11 +1,13 @@
 import time
-import faiss
-from fastapi import FastAPI, UploadFile, File
+from fastapi import FastAPI, UploadFile, File, HTTPException
 from pydantic import BaseModel
 from agent import rag_chat, split_document, add_knowledge, parse_file, get_all_knowledge
 from logger_utils import logger
 
 app = FastAPI()
+
+# 上传文件大小上限（10MB），防止超大文件导致 OOM
+MAX_UPLOAD_SIZE = 10 * 1024 * 1024
 
 
 class ChatRequest(BaseModel):
@@ -29,7 +31,11 @@ def chat(request: ChatRequest):
 @app.post("/upload")
 async def upload(file: UploadFile = File(...)):
     try:
-        file_bytes = await file.read()
+        # 只读取上限+1字节，若超过上限则拒绝，避免一次性加载大文件到内存
+        file_bytes = await file.read(MAX_UPLOAD_SIZE + 1)
+        if len(file_bytes) > MAX_UPLOAD_SIZE:
+            raise HTTPException(status_code=413, detail="文件大小超过10MB限制")
+
         text = parse_file(file.filename, file_bytes)
         chunks = split_document(text, chunk_size=400)
 
@@ -42,8 +48,10 @@ async def upload(file: UploadFile = File(...)):
             "total_chunks": total,
         }
 
+    except HTTPException:
+        raise
     except Exception as e:
-        logger.error("文件上传失败:{e}")
+        logger.error(f"文件上传失败:{e}")
         return {"message": "上传失败", "error": str(e)}
 
 

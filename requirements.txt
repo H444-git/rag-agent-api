@@ -10,3 +10,7 @@ pymupdf
 python-docx
 colorlog
 python-dotenv
+torch
+pytest
+httpx
+python-multipart
