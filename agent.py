@@ -145,21 +145,27 @@ def parse_file(filename, file_bytes):
 
 
 knowledge = load_knowledge("知识库简易版.txt", chunk_size=150)
-knowledge_vecs = model.encode(knowledge) if knowledge else []
 
 import faiss
 
-# 将知识向量转为 float32（FAISS 要求的数据类型）
-knowledge_vecs_faiss = np.array(knowledge_vecs).astype("float32")
+if knowledge:
+    # 将知识向量转为 float32（FAISS 要求的数据类型）
+    knowledge_vecs = model.encode(knowledge)
+    knowledge_vecs_faiss = np.array(knowledge_vecs).astype("float32")
 
-# 获取向量维度
-dim = knowledge_vecs_faiss.shape[1]
+    # 获取向量维度
+    dim = knowledge_vecs_faiss.shape[1]
 
-# 创建 FAISS 索引（使用内积索引，配合归一化实现余弦相似度）
-index = faiss.IndexFlatIP(dim)  # IP = Inner Product（内积）
-# 归一化向量，使内积等于余弦相似度
-faiss.normalize_L2(knowledge_vecs_faiss)
-index.add(knowledge_vecs_faiss)
+    # 创建 FAISS 索引（使用内积索引，配合归一化实现余弦相似度）
+    index = faiss.IndexFlatIP(dim)  # IP = Inner Product（内积）
+    # 归一化向量，使内积等于余弦相似度
+    faiss.normalize_L2(knowledge_vecs_faiss)
+    index.add(knowledge_vecs_faiss)
+else:
+    # 知识库为空时，用占位文本推断向量维度并创建空索引，
+    # 避免对一维空数组取 shape[1] 触发 IndexError 导致启动崩溃
+    dim = model.encode([""]).shape[1]
+    index = faiss.IndexFlatIP(dim)
 
 print(f"✅ FAISS 索引已创建，包含 {index.ntotal} 条知识向量")
 
@@ -318,7 +324,9 @@ def call_llm(prompt, mode, tools=None):
         "Content-Type": "application/json",
         "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
     }
-    response = requests.post(url, headers=headers, json=data, stream=use_stream)
+    response = requests.post(
+        url, headers=headers, json=data, stream=use_stream, timeout=60
+    )
 
     if use_stream:
         full_content = ""
@@ -404,7 +412,11 @@ def rag_chat(message, history):
             if "tool_calls" in message_obj and message_obj["tool_calls"]:
                 tool_call = message_obj["tool_calls"][0]
                 tool_name = tool_call["function"]["name"]
-                tool_args = json.loads(tool_call["function"]["arguments"])
+                try:
+                    tool_args = json.loads(tool_call["function"]["arguments"])
+                except (json.JSONDecodeError, TypeError) as e:
+                    logger.error(f"工具参数解析失败: {e}")
+                    return "工具调用参数解析失败，请重试"
 
                 logger.info(f"🔧 模型请求调用工具: {tool_name}")
                 logger.info(f"📝 工具参数: {tool_args}")
