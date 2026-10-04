@@ -1,4 +1,6 @@
 import os
+import ast
+import operator
 
 from dotenv import load_dotenv
 
@@ -113,11 +115,13 @@ def load_knowledge(file_path, chunk_size=100):
 def parse_pdf(file_bytes):
     """解析 PDF 字节流，返回纯文本"""
     doc = fitz.open(stream=file_bytes, filetype="pdf")
-    text = ""
-    for page in doc:
-        text += page.get_text()
-    doc.close()
-    return text
+    try:
+        text = ""
+        for page in doc:
+            text += page.get_text()
+        return text
+    finally:
+        doc.close()
 
 
 def parse_docx(file_bytes):
@@ -264,18 +268,42 @@ def web_search_tavily(query):
 
 def calculate(expression):
     """
-    安全地计算数学表达式
+    安全地计算数学表达式（仅支持数字与 + - * / % 以及括号），
+    使用 AST 求值，绝不执行任意代码。
     """
     # 只允许数字、运算符、括号、空格
     allowed_chars = set("0123456789+-*/().% ")
-    if not all(c in allowed_chars for c in expression):
+    if not isinstance(expression, str) or not expression or not all(c in allowed_chars for c in expression):
         return "错误：表达式包含不支持的字符"
 
+    _OPERATORS = {
+        ast.Add: operator.add,
+        ast.Sub: operator.sub,
+        ast.Mult: operator.mul,
+        ast.Div: operator.truediv,
+        ast.Mod: operator.mod,
+        ast.USub: operator.neg,
+        ast.UAdd: operator.pos,
+    }
+
+    def _eval(node):
+        if isinstance(node, ast.Expression):
+            return _eval(node.body)
+        if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
+            return node.value
+        if isinstance(node, ast.BinOp) and type(node.op) in _OPERATORS:
+            return _OPERATORS[type(node.op)](_eval(node.left), _eval(node.right))
+        if isinstance(node, ast.UnaryOp) and type(node.op) in _OPERATORS:
+            return _OPERATORS[type(node.op)](_eval(node.operand))
+        raise ValueError("不支持的表达式结构")
+
     try:
-        # 使用 eval 计算，但限制全局和局部命名空间为空，避免执行危险代码
-        result = eval(expression, {"__builtins__": {}}, {})
+        tree = ast.parse(expression, mode="eval")
+        result = _eval(tree)
         return f"计算结果：{expression} = {result}"
-    except Exception as e:
+    except ZeroDivisionError:
+        return "计算错误：除数不能为零"
+    except (SyntaxError, ValueError, TypeError) as e:
         return f"计算错误：{str(e)}"
 
 
@@ -397,49 +425,77 @@ def rag_chat(message, history):
             return result["error"]
 
         # 检查是否是工具调用
-        if isinstance(result, dict) and "choices" in result:
-            choice = result["choices"][0]
-            message_obj = choice["message"]
-
-            if "tool_calls" in message_obj and message_obj["tool_calls"]:
-                tool_call = message_obj["tool_calls"][0]
-                tool_name = tool_call["function"]["name"]
-                tool_args = json.loads(tool_call["function"]["arguments"])
-
-                logger.info(f"🔧 模型请求调用工具: {tool_name}")
-                logger.info(f"📝 工具参数: {tool_args}")
-
-                if tool_name == "search_web":
-                    search_results = web_search_tavily(tool_args["query"])
-                    logger.info(f"搜索完成,返回{search_results}字符")
-                    context["tool_results"].append(
-                        {"tool": tool_name, "args": tool_args, "result": search_results}
-                    )
-                    context["round_count"] += 1
-                    context["last_tool_call"] = {
-                        "tool_name": tool_name,
-                        "args": tool_args,
-                    }
-                    continue
-                elif tool_name == "calculate":
-                    result = calculate(tool_args["expression"])
-                    logger.info(f"计算结果:{result}")
-                    context["tool_results"].append(
-                        {"tool": tool_name, "args": tool_args, "result": result}
-                    )
-                    context["round_count"] += 1
-                    continue
-                else:
-                    logger.error(f"未知工具:{tool_name}")
-                    return f"未知工具: {tool_name}"
-            else:
-                # 直接回答
-                content = message_obj.get("content", "")
-                logger.info("回答完成！")
-                return content
-        elif isinstance(result, str):
+        if isinstance(result, str):
             # 流式返回的字符串
             logger.info("回答完成(流式)")
             return result
+
+        if not isinstance(result, dict):
+            logger.error(f"模型返回非字典响应: {type(result)}")
+            return "模型返回格式异常，请稍后重试"
+
+        choices = result.get("choices") or []
+        if not choices:
+            logger.error(f"模型响应缺少 choices: {result}")
+            return "模型响应异常，请稍后重试"
+
+        message_obj = choices[0].get("message") or {}
+        tool_calls = message_obj.get("tool_calls")
+
+        if tool_calls:
+            tool_call = tool_calls[0]
+            function = tool_call.get("function") or {}
+            tool_name = function.get("name")
+            raw_args = function.get("arguments", "{}")
+
+            try:
+                tool_args = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
+                if not isinstance(tool_args, dict):
+                    tool_args = {}
+            except json.JSONDecodeError:
+                logger.error(f"工具参数 JSON 解析失败: {raw_args!r}")
+                return "模型返回的工具参数格式错误，请重试"
+
+            if not tool_name:
+                logger.error("工具调用缺少名称")
+                return "模型返回的工具调用缺少名称，请重试"
+
+            logger.info(f"🔧 模型请求调用工具: {tool_name}")
+            logger.info(f"📝 工具参数: {tool_args}")
+
+            if tool_name == "search_web":
+                query = tool_args.get("query")
+                if not isinstance(query, str) or not query:
+                    return "search_web 工具缺少有效的 query 参数"
+                search_results = web_search_tavily(query)
+                logger.info(f"搜索完成,返回{search_results}字符")
+                context["tool_results"].append(
+                    {"tool": tool_name, "args": tool_args, "result": search_results}
+                )
+                context["round_count"] += 1
+                context["last_tool_call"] = {
+                    "tool_name": tool_name,
+                    "args": tool_args,
+                }
+                continue
+            elif tool_name == "calculate":
+                expression = tool_args.get("expression")
+                if not isinstance(expression, str):
+                    return "calculate 工具缺少有效的 expression 参数"
+                result = calculate(expression)
+                logger.info(f"计算结果:{result}")
+                context["tool_results"].append(
+                    {"tool": tool_name, "args": tool_args, "result": result}
+                )
+                context["round_count"] += 1
+                continue
+            else:
+                logger.error(f"未知工具:{tool_name}")
+                return f"未知工具: {tool_name}"
+        else:
+            # 直接回答
+            content = message_obj.get("content", "")
+            logger.info("回答完成！")
+            return content
     logger.warning(f"达到最大轮次{context['max_rounds']},任务未完成")
     return f"经过{context['max_rounds']}轮尝试，任务未完成。已获取的信息：{context['tool_results']}"
