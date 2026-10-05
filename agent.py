@@ -1,4 +1,5 @@
 import os
+import threading
 
 from dotenv import load_dotenv
 
@@ -112,11 +113,11 @@ def load_knowledge(file_path, chunk_size=100):
 
 def parse_pdf(file_bytes):
     """解析 PDF 字节流，返回纯文本"""
-    doc = fitz.open(stream=file_bytes, filetype="pdf")
-    text = ""
-    for page in doc:
-        text += page.get_text()
-    doc.close()
+    # 使用 with 语句确保 fitz.Document 在异常时也能被关闭，避免资源泄漏
+    with fitz.open(stream=file_bytes, filetype="pdf") as doc:
+        text = ""
+        for page in doc:
+            text += page.get_text()
     return text
 
 
@@ -163,10 +164,17 @@ index.add(knowledge_vecs_faiss)
 
 print(f"✅ FAISS 索引已创建，包含 {index.ntotal} 条知识向量")
 
+# 保护 knowledge 列表与 FAISS index 的读写锁。
+# /upload（async，事件循环线程）会调用 add_knowledge 写入，
+# /chat（sync，线程池线程）会调用 search_mostk 读取，
+# 两者可能并发执行；FAISS Index 非线程安全，必须加锁。
+_knowledge_lock = threading.RLock()
+
 
 def get_all_knowledge():
-    """返回当前知识库里的所有文本块"""
-    return knowledge
+    """返回当前知识库里的所有文本块（返回副本，避免调用方迭代时被并发修改）"""
+    with _knowledge_lock:
+        return list(knowledge)
 
 
 def add_knowledge(new_chunks):
@@ -176,24 +184,27 @@ def add_knowledge(new_chunks):
     """
     global knowledge
 
-    # 1. 向量化
+    # 1. 向量化（不涉及共享状态，可在锁外执行）
     new_vecs = model.encode(new_chunks)
     new_vecs_faiss = np.array(new_vecs).astype("float32")
 
     # 2. 归一化（FAISS 要求）
     faiss.normalize_L2(new_vecs_faiss)
 
-    # 3. 追加到 knowledge 和 index，保证顺序一致
-    knowledge.extend(new_chunks)
-    index.add(new_vecs_faiss)
+    # 3. 追加到 knowledge 和 index，保证顺序一致。
+    #    必须加锁：/upload 与 /chat 可能并发，FAISS 非线程安全。
+    with _knowledge_lock:
+        knowledge.extend(new_chunks)
+        index.add(new_vecs_faiss)
+        total = len(knowledge)
 
     # 打印新增的每一块内容
     for i, chunk in enumerate(new_chunks):
         logger.info(f"新增块 {i+1}: {chunk}...")
 
-    logger.info(f"知识库更新：新增 {len(new_chunks)} 块，当前共 {len(knowledge)} 块")
+    logger.info(f"知识库更新：新增 {len(new_chunks)} 块，当前共 {total} 块")
 
-    return len(new_chunks), len(knowledge)
+    return len(new_chunks), total
 
 
 def search_mostk(query_vec, K=16, threshold=0.4):
@@ -204,23 +215,26 @@ def search_mostk(query_vec, K=16, threshold=0.4):
     query_vec_faiss = np.array([query_vec]).astype("float32")
     faiss.normalize_L2(query_vec_faiss)
 
-    # FAISS 检索
-    distances, indices = index.search(query_vec_faiss, K)
+    # FAISS 检索与 knowledge 读取必须加锁，避免与 add_knowledge 并发导致
+    # FAISS 内部状态损坏（segfault）或读到不一致的 knowledge/index。
+    with _knowledge_lock:
+        distances, indices = index.search(query_vec_faiss, K)
 
-    # distances 是余弦相似度（因为向量已归一化）
-    # indices 是知识库中的索引位置
+        # distances 是余弦相似度（因为向量已归一化）
+        # indices 是知识库中的索引位置
 
-    matched = []
-    for i, (dist, idx) in enumerate(zip(distances[0], indices[0])):
-        if idx == -1:
-            continue
-        sim = float(dist)  # dist 就是余弦相似度
-        logger.debug(f"🔍 知识块 {idx+1} 的注意力得分: {sim:.4f}")
-        if sim >= threshold:
-            matched.append(knowledge[idx])
-        else:
-            logger.debug(f"    ⏭️  知识块 {idx+1} 低于阈值 {threshold}，已跳过")
-        logger.info(f"检索完成:命中{len(matched)}条知识")
+        matched = []
+        for i, (dist, idx) in enumerate(zip(distances[0], indices[0])):
+            if idx == -1:
+                continue
+            sim = float(dist)  # dist 就是余弦相似度
+            logger.debug(f"🔍 知识块 {idx+1} 的注意力得分: {sim:.4f}")
+            if sim >= threshold:
+                matched.append(knowledge[idx])
+            else:
+                logger.debug(f"    ⏭️  知识块 {idx+1} 低于阈值 {threshold}，已跳过")
+
+    logger.info(f"检索完成:命中{len(matched)}条知识")
     return matched[:K]
 
 
@@ -262,19 +276,73 @@ def web_search_tavily(query):
         return f"搜索失败: {str(e)}"
 
 
+import ast
+import operator as _op
+
+
+# 计算结果的最大允许量级，防止大整数/大浮点数导致内存耗尽（DoS）
+_MAX_CALC_VALUE = 1e100
+
+
+def _safe_eval_node(node):
+    """
+    递归求值 AST 节点，仅允许数字字面量和 + - * / // % 运算。
+    显式拒绝 ** (Pow) 以及任何其他节点，避免 eval 带来的代码执行与资源耗尽风险。
+    同时对中间结果做量级限制，防止 999999999 * 999999999 这类乘法耗尽内存。
+    """
+    if isinstance(node, ast.Expression):
+        return _safe_eval_node(node.body)
+    if isinstance(node, ast.Constant):
+        if isinstance(node.value, (int, float)) and not isinstance(node.value, bool):
+            val = node.value
+            if isinstance(val, int) and abs(val) > _MAX_CALC_VALUE:
+                raise ValueError("数值过大")
+            return val
+        raise ValueError("仅支持数字字面量")
+    if isinstance(node, ast.UnaryOp):
+        operand = _safe_eval_node(node.operand)
+        if isinstance(node.op, ast.UAdd):
+            return +operand
+        if isinstance(node.op, ast.USub):
+            return -operand
+        raise ValueError("不支持的一元运算符")
+    if isinstance(node, ast.BinOp):
+        left = _safe_eval_node(node.left)
+        right = _safe_eval_node(node.right)
+        op_map = {
+            ast.Add: _op.add,
+            ast.Sub: _op.sub,
+            ast.Mult: _op.mul,
+            ast.Div: _op.truediv,
+            ast.FloorDiv: _op.floordiv,
+            ast.Mod: _op.mod,
+        }
+        op_func = op_map.get(type(node.op))
+        if op_func is None:
+            # 显式拒绝 ** (ast.Pow) 以及其他未列出的运算符
+            raise ValueError("不支持的运算符（禁止使用 ** 等）")
+        result = op_func(left, right)
+        # 量级检查：防止乘法/加法产生超大数导致内存耗尽
+        if isinstance(result, (int, float)):
+            if isinstance(result, int) and abs(result) > _MAX_CALC_VALUE:
+                raise ValueError("计算结果数值过大")
+            elif isinstance(result, float) and (result != result or abs(result) > _MAX_CALC_VALUE):
+                raise ValueError("计算结果数值过大或非法")
+        return result
+    raise ValueError("表达式包含不支持的语法")
+
+
 def calculate(expression):
     """
-    安全地计算数学表达式
+    安全地计算数学表达式（仅支持数字与 + - * / // % 运算符）。
+    不使用 eval，避免代码执行与大整数指数运算造成的内存耗尽风险。
     """
-    # 只允许数字、运算符、括号、空格
-    allowed_chars = set("0123456789+-*/().% ")
-    if not all(c in allowed_chars for c in expression):
-        return "错误：表达式包含不支持的字符"
-
     try:
-        # 使用 eval 计算，但限制全局和局部命名空间为空，避免执行危险代码
-        result = eval(expression, {"__builtins__": {}}, {})
+        tree = ast.parse(expression, mode="eval")
+        result = _safe_eval_node(tree)
         return f"计算结果：{expression} = {result}"
+    except (SyntaxError, ValueError, ZeroDivisionError, TypeError) as e:
+        return f"计算错误：{str(e)}"
     except Exception as e:
         return f"计算错误：{str(e)}"
 
