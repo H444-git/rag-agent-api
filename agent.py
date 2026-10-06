@@ -220,7 +220,7 @@ def search_mostk(query_vec, K=16, threshold=0.4):
             matched.append(knowledge[idx])
         else:
             logger.debug(f"    ⏭️  知识块 {idx+1} 低于阈值 {threshold}，已跳过")
-        logger.info(f"检索完成:命中{len(matched)}条知识")
+    logger.info(f"检索完成:命中{len(matched)}条知识")
     return matched[:K]
 
 
@@ -266,6 +266,9 @@ def calculate(expression):
     """
     安全地计算数学表达式
     """
+    # 拒绝幂运算符 **，防止天文数字导致内存耗尽（如 9**9**9**9）
+    if "**" in expression:
+        return "错误：不支持幂运算"
     # 只允许数字、运算符、括号、空格
     allowed_chars = set("0123456789+-*/().% ")
     if not all(c in allowed_chars for c in expression):
@@ -370,8 +373,8 @@ def rag_chat(message, history):
         tool_summary = (
             "\n".join(
                 [
-                    f"第{t['tool']}次搜索：{t['result'][:200]}..."
-                    for t in context["tool_results"]
+                    f"第{i+1}次搜索：{t['result'][:200]}..."
+                    for i, t in enumerate(context["tool_results"])
                 ]
             )
             if context["tool_results"]
