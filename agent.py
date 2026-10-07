@@ -145,23 +145,26 @@ def parse_file(filename, file_bytes):
 
 
 knowledge = load_knowledge("知识库简易版.txt", chunk_size=150)
-knowledge_vecs = model.encode(knowledge) if knowledge else []
 
 import faiss
 
-# 将知识向量转为 float32（FAISS 要求的数据类型）
-knowledge_vecs_faiss = np.array(knowledge_vecs).astype("float32")
-
-# 获取向量维度
-dim = knowledge_vecs_faiss.shape[1]
-
-# 创建 FAISS 索引（使用内积索引，配合归一化实现余弦相似度）
-index = faiss.IndexFlatIP(dim)  # IP = Inner Product（内积）
-# 归一化向量，使内积等于余弦相似度
-faiss.normalize_L2(knowledge_vecs_faiss)
-index.add(knowledge_vecs_faiss)
-
-print(f"✅ FAISS 索引已创建，包含 {index.ntotal} 条知识向量")
+# FAISS 索引初始化：知识库为空时延迟到 add_knowledge 时创建
+if knowledge:
+    knowledge_vecs = model.encode(knowledge)
+    # 将知识向量转为 float32（FAISS 要求的数据类型）
+    knowledge_vecs_faiss = np.array(knowledge_vecs).astype("float32")
+    # 获取向量维度
+    dim = knowledge_vecs_faiss.shape[1]
+    # 创建 FAISS 索引（使用内积索引，配合归一化实现余弦相似度）
+    index = faiss.IndexFlatIP(dim)  # IP = Inner Product（内积）
+    # 归一化向量，使内积等于余弦相似度
+    faiss.normalize_L2(knowledge_vecs_faiss)
+    index.add(knowledge_vecs_faiss)
+    print(f"✅ FAISS 索引已创建，包含 {index.ntotal} 条知识向量")
+else:
+    dim = None
+    index = None
+    print("⚠️ 知识库为空，FAISS 索引待初始化（等待通过 /upload 上传文件）")
 
 
 def get_all_knowledge():
@@ -174,7 +177,7 @@ def add_knowledge(new_chunks):
     向知识库追加新的文本块，并同步更新 FAISS 索引
     返回：新增的块数、当前总块数
     """
-    global knowledge
+    global knowledge, index, dim
 
     # 1. 向量化
     new_vecs = model.encode(new_chunks)
@@ -183,7 +186,13 @@ def add_knowledge(new_chunks):
     # 2. 归一化（FAISS 要求）
     faiss.normalize_L2(new_vecs_faiss)
 
-    # 3. 追加到 knowledge 和 index，保证顺序一致
+    # 3. 如果 index 尚未初始化（知识库原本为空），用首块向量的维度创建
+    if index is None:
+        dim = new_vecs_faiss.shape[1]
+        index = faiss.IndexFlatIP(dim)
+        logger.info(f"FAISS 索引首次初始化，维度 {dim}")
+
+    # 4. 追加到 knowledge 和 index，保证顺序一致
     knowledge.extend(new_chunks)
     index.add(new_vecs_faiss)
 
@@ -200,6 +209,10 @@ def search_mostk(query_vec, K=16, threshold=0.4):
     """
     使用 FAISS 检索最相关的 K 条知识
     """
+    # 防御：知识库或索引未就绪时返回空
+    if not knowledge or index is None:
+        return []
+
     # 将查询向量转为 float32 并归一化
     query_vec_faiss = np.array([query_vec]).astype("float32")
     faiss.normalize_L2(query_vec_faiss)
