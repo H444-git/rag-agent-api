@@ -1,4 +1,5 @@
 import os
+import threading
 
 from dotenv import load_dotenv
 
@@ -113,11 +114,13 @@ def load_knowledge(file_path, chunk_size=100):
 def parse_pdf(file_bytes):
     """解析 PDF 字节流，返回纯文本"""
     doc = fitz.open(stream=file_bytes, filetype="pdf")
-    text = ""
-    for page in doc:
-        text += page.get_text()
-    doc.close()
-    return text
+    try:
+        text = ""
+        for page in doc:
+            text += page.get_text()
+        return text
+    finally:
+        doc.close()
 
 
 def parse_docx(file_bytes):
@@ -150,18 +153,24 @@ knowledge_vecs = model.encode(knowledge) if knowledge else []
 import faiss
 
 # 将知识向量转为 float32（FAISS 要求的数据类型）
-knowledge_vecs_faiss = np.array(knowledge_vecs).astype("float32")
-
-# 获取向量维度
-dim = knowledge_vecs_faiss.shape[1]
+if knowledge:
+    knowledge_vecs_faiss = np.array(knowledge_vecs).astype("float32")
+    dim = knowledge_vecs_faiss.shape[1]
+else:
+    knowledge_vecs_faiss = np.empty((0, 0), dtype="float32")
+    dim = 0
 
 # 创建 FAISS 索引（使用内积索引，配合归一化实现余弦相似度）
 index = faiss.IndexFlatIP(dim)  # IP = Inner Product（内积）
 # 归一化向量，使内积等于余弦相似度
-faiss.normalize_L2(knowledge_vecs_faiss)
-index.add(knowledge_vecs_faiss)
+if knowledge_vecs_faiss.size > 0:
+    faiss.normalize_L2(knowledge_vecs_faiss)
+    index.add(knowledge_vecs_faiss)
 
 print(f"✅ FAISS 索引已创建，包含 {index.ntotal} 条知识向量")
+
+# 保护 knowledge 列表和 FAISS index 的并发访问
+_knowledge_lock = threading.Lock()
 
 
 def get_all_knowledge():
@@ -176,16 +185,32 @@ def add_knowledge(new_chunks):
     """
     global knowledge
 
-    # 1. 向量化
+    if not new_chunks:
+        return 0, len(knowledge)
+
+    # 1. 向量化（不持锁，避免阻塞其他请求）
     new_vecs = model.encode(new_chunks)
     new_vecs_faiss = np.array(new_vecs).astype("float32")
 
     # 2. 归一化（FAISS 要求）
     faiss.normalize_L2(new_vecs_faiss)
 
-    # 3. 追加到 knowledge 和 index，保证顺序一致
-    knowledge.extend(new_chunks)
-    index.add(new_vecs_faiss)
+    # 3. 持锁追加到 knowledge 和 index，保证顺序一致
+    with _knowledge_lock:
+        # 首次添加后，如果 FAISS 维度发生变化，需要重建索引
+        if index.ntotal == 0:
+            dim = new_vecs_faiss.shape[1]
+            new_index = faiss.IndexFlatIP(dim)
+            new_index.add(new_vecs_faiss)
+            globals()["index"] = new_index
+        else:
+            # 维度不一致的防御检查
+            if new_vecs_faiss.shape[1] != index.d:
+                raise ValueError(
+                    f"向量维度不匹配：新向量 {new_vecs_faiss.shape[1]} vs 索引 {index.d}"
+                )
+            index.add(new_vecs_faiss)
+        knowledge.extend(new_chunks)
 
     # 打印新增的每一块内容
     for i, chunk in enumerate(new_chunks):
@@ -204,23 +229,28 @@ def search_mostk(query_vec, K=16, threshold=0.4):
     query_vec_faiss = np.array([query_vec]).astype("float32")
     faiss.normalize_L2(query_vec_faiss)
 
-    # FAISS 检索
-    distances, indices = index.search(query_vec_faiss, K)
-
-    # distances 是余弦相似度（因为向量已归一化）
-    # indices 是知识库中的索引位置
+    # FAISS 检索（持锁保护并发访问）
+    with _knowledge_lock:
+        if index.ntotal == 0:
+            return []
+        distances, indices = index.search(query_vec_faiss, K)
+        # 在锁内拿到快照，避免后续 knowledge 列表变化导致越界
+        knowledge_snapshot = list(knowledge)
 
     matched = []
     for i, (dist, idx) in enumerate(zip(distances[0], indices[0])):
         if idx == -1:
             continue
+        # 防御性检查：确保索引不超出快照范围
+        if idx >= len(knowledge_snapshot):
+            continue
         sim = float(dist)  # dist 就是余弦相似度
         logger.debug(f"🔍 知识块 {idx+1} 的注意力得分: {sim:.4f}")
         if sim >= threshold:
-            matched.append(knowledge[idx])
+            matched.append(knowledge_snapshot[idx])
         else:
             logger.debug(f"    ⏭️  知识块 {idx+1} 低于阈值 {threshold}，已跳过")
-        logger.info(f"检索完成:命中{len(matched)}条知识")
+    logger.info(f"检索完成:命中{len(matched)}条知识")
     return matched[:K]
 
 
@@ -322,22 +352,26 @@ def call_llm(prompt, mode, tools=None):
 
     if use_stream:
         full_content = ""
-        for line in response.iter_lines():
-            if line:
-                line = line.decode("utf-8")
-                if line.startswith("data: "):
-                    try:
-                        chunk = json.loads(line[6:])
-                        delta = chunk.get("choices", [{}])[0].get("delta", {})
-                        content = delta.get("content", "")
-                        if content:
-                            full_content += content
-                            print(content, end="", flush=True)  # 实时打印
-                    except json.JSONDecodeError:
-                        continue
+        try:
+            for line in response.iter_lines():
+                if line:
+                    line = line.decode("utf-8")
+                    if line.startswith("data: "):
+                        try:
+                            chunk = json.loads(line[6:])
+                            delta = chunk.get("choices", [{}])[0].get("delta", {})
+                            content = delta.get("content", "")
+                            if content:
+                                full_content += content
+                                print(content, end="", flush=True)  # 实时打印
+                        except json.JSONDecodeError:
+                            continue
+        finally:
+            response.close()
         return full_content
     else:
         result = response.json()
+        response.close()
         return result
 
 
