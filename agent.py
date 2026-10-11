@@ -152,16 +152,19 @@ import faiss
 # 将知识向量转为 float32（FAISS 要求的数据类型）
 knowledge_vecs_faiss = np.array(knowledge_vecs).astype("float32")
 
-# 获取向量维度
-dim = knowledge_vecs_faiss.shape[1]
-
-# 创建 FAISS 索引（使用内积索引，配合归一化实现余弦相似度）
-index = faiss.IndexFlatIP(dim)  # IP = Inner Product（内积）
-# 归一化向量，使内积等于余弦相似度
-faiss.normalize_L2(knowledge_vecs_faiss)
-index.add(knowledge_vecs_faiss)
-
-print(f"✅ FAISS 索引已创建，包含 {index.ntotal} 条知识向量")
+# 获取向量维度：当知识库为空时，使用模型输出维度初始化索引，避免 shape[1] 崩溃
+if knowledge_vecs_faiss.size == 0:
+    dim = model.get_sentence_embedding_dimension()
+    index = faiss.IndexFlatIP(dim)
+    print("⚠️ 知识库为空，已创建空的 FAISS 索引，可通过 /upload 接口添加知识")
+else:
+    dim = knowledge_vecs_faiss.shape[1]
+    # 创建 FAISS 索引（使用内积索引，配合归一化实现余弦相似度）
+    index = faiss.IndexFlatIP(dim)  # IP = Inner Product（内积）
+    # 归一化向量，使内积等于余弦相似度
+    faiss.normalize_L2(knowledge_vecs_faiss)
+    index.add(knowledge_vecs_faiss)
+    print(f"✅ FAISS 索引已创建，包含 {index.ntotal} 条知识向量")
 
 
 def get_all_knowledge():
@@ -262,20 +265,53 @@ def web_search_tavily(query):
         return f"搜索失败: {str(e)}"
 
 
+def _safe_eval(node):
+    """递归求值：仅允许数字字面量与一元/二元算术运算。"""
+    import ast
+
+    if isinstance(node, ast.Expression):
+        return _safe_eval(node.body)
+    if isinstance(node, ast.Constant):
+        if isinstance(node.value, (int, float)) and not isinstance(node.value, bool):
+            return node.value
+        raise ValueError("仅支持数字字面量")
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.UAdd, ast.USub)):
+        operand = _safe_eval(node.operand)
+        return +operand if isinstance(node.op, ast.UAdd) else -operand
+    if isinstance(node, ast.BinOp):
+        left = _safe_eval(node.left)
+        right = _safe_eval(node.right)
+        op = node.op
+        if isinstance(op, ast.Add):
+            return left + right
+        if isinstance(op, ast.Sub):
+            return left - right
+        if isinstance(op, ast.Mult):
+            return left * right
+        if isinstance(op, ast.Div):
+            return left / right
+        if isinstance(op, ast.Mod):
+            return left % right
+        raise ValueError("不支持的运算符")
+    raise ValueError("不支持的语法")
+
+
 def calculate(expression):
     """
-    安全地计算数学表达式
+    安全地计算数学表达式（不使用 eval，仅允许数字与 + - * / % 运算）
     """
-    # 只允许数字、运算符、括号、空格
+    import ast
+
+    # 字符白名单（仅数字、运算符、括号、空格、小数点）
     allowed_chars = set("0123456789+-*/().% ")
     if not all(c in allowed_chars for c in expression):
         return "错误：表达式包含不支持的字符"
 
     try:
-        # 使用 eval 计算，但限制全局和局部命名空间为空，避免执行危险代码
-        result = eval(expression, {"__builtins__": {}}, {})
+        tree = ast.parse(expression, mode="eval")
+        result = _safe_eval(tree)
         return f"计算结果：{expression} = {result}"
-    except Exception as e:
+    except (SyntaxError, ValueError, ZeroDivisionError, TypeError) as e:
         return f"计算错误：{str(e)}"
 
 
