@@ -1,4 +1,5 @@
 import os
+import threading
 
 from dotenv import load_dotenv
 
@@ -145,21 +146,28 @@ def parse_file(filename, file_bytes):
 
 
 knowledge = load_knowledge("知识库简易版.txt", chunk_size=150)
-knowledge_vecs = model.encode(knowledge) if knowledge else []
 
 import faiss
 
-# 将知识向量转为 float32（FAISS 要求的数据类型）
-knowledge_vecs_faiss = np.array(knowledge_vecs).astype("float32")
-
-# 获取向量维度
-dim = knowledge_vecs_faiss.shape[1]
-
 # 创建 FAISS 索引（使用内积索引，配合归一化实现余弦相似度）
-index = faiss.IndexFlatIP(dim)  # IP = Inner Product（内积）
-# 归一化向量，使内积等于余弦相似度
-faiss.normalize_L2(knowledge_vecs_faiss)
-index.add(knowledge_vecs_faiss)
+if knowledge:
+    knowledge_vecs = model.encode(knowledge)
+    # 将知识向量转为 float32（FAISS 要求的数据类型）
+    knowledge_vecs_faiss = np.array(knowledge_vecs).astype("float32")
+    # 获取向量维度
+    dim = knowledge_vecs_faiss.shape[1]
+    index = faiss.IndexFlatIP(dim)  # IP = Inner Product（内积）
+    # 归一化向量，使内积等于余弦相似度
+    faiss.normalize_L2(knowledge_vecs_faiss)
+    index.add(knowledge_vecs_faiss)
+else:
+    # 知识库为空时，使用 dummy 向量获取维度，创建空索引，避免启动崩溃
+    dummy_vec = model.encode("dummy")
+    dim = np.array(dummy_vec).astype("float32").shape[0]
+    index = faiss.IndexFlatIP(dim)
+
+# 保护知识库和索引的并发修改
+knowledge_lock = threading.Lock()
 
 print(f"✅ FAISS 索引已创建，包含 {index.ntotal} 条知识向量")
 
@@ -184,8 +192,9 @@ def add_knowledge(new_chunks):
     faiss.normalize_L2(new_vecs_faiss)
 
     # 3. 追加到 knowledge 和 index，保证顺序一致
-    knowledge.extend(new_chunks)
-    index.add(new_vecs_faiss)
+    with knowledge_lock:
+        knowledge.extend(new_chunks)
+        index.add(new_vecs_faiss)
 
     # 打印新增的每一块内容
     for i, chunk in enumerate(new_chunks):
@@ -404,13 +413,21 @@ def rag_chat(message, history):
             if "tool_calls" in message_obj and message_obj["tool_calls"]:
                 tool_call = message_obj["tool_calls"][0]
                 tool_name = tool_call["function"]["name"]
-                tool_args = json.loads(tool_call["function"]["arguments"])
+                try:
+                    tool_args = json.loads(tool_call["function"]["arguments"])
+                except json.JSONDecodeError as e:
+                    logger.error(f"工具参数 JSON 解析失败: {e}")
+                    return f"工具参数解析失败: {e}"
 
                 logger.info(f"🔧 模型请求调用工具: {tool_name}")
                 logger.info(f"📝 工具参数: {tool_args}")
 
                 if tool_name == "search_web":
-                    search_results = web_search_tavily(tool_args["query"])
+                    query = tool_args.get("query")
+                    if not query or not isinstance(query, str):
+                        logger.error("search_web 工具缺少有效的 query 参数")
+                        return "工具参数错误：search_web 缺少有效的 query 参数"
+                    search_results = web_search_tavily(query)
                     logger.info(f"搜索完成,返回{search_results}字符")
                     context["tool_results"].append(
                         {"tool": tool_name, "args": tool_args, "result": search_results}
@@ -422,7 +439,11 @@ def rag_chat(message, history):
                     }
                     continue
                 elif tool_name == "calculate":
-                    result = calculate(tool_args["expression"])
+                    expression = tool_args.get("expression")
+                    if expression is None or not isinstance(expression, str):
+                        logger.error("calculate 工具缺少有效的 expression 参数")
+                        return "工具参数错误：calculate 缺少有效的 expression 参数"
+                    result = calculate(expression)
                     logger.info(f"计算结果:{result}")
                     context["tool_results"].append(
                         {"tool": tool_name, "args": tool_args, "result": result}
