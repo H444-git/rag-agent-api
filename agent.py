@@ -5,7 +5,9 @@ from dotenv import load_dotenv
 load_dotenv()
 
 import requests
+import ast
 import json
+import threading
 import numpy as np
 import fitz
 from text2vec import SentenceModel
@@ -149,19 +151,25 @@ knowledge_vecs = model.encode(knowledge) if knowledge else []
 
 import faiss
 
-# 将知识向量转为 float32（FAISS 要求的数据类型）
-knowledge_vecs_faiss = np.array(knowledge_vecs).astype("float32")
+# knowledge 列表与 FAISS 索引会被 /upload 修改、被 /chat 并发读取，必须成对原子更新
+_index_lock = threading.Lock()
 
-# 获取向量维度
-dim = knowledge_vecs_faiss.shape[1]
 
-# 创建 FAISS 索引（使用内积索引，配合归一化实现余弦相似度）
-index = faiss.IndexFlatIP(dim)  # IP = Inner Product（内积）
-# 归一化向量，使内积等于余弦相似度
-faiss.normalize_L2(knowledge_vecs_faiss)
-index.add(knowledge_vecs_faiss)
+def _build_index(vecs):
+    """根据向量构建 FAISS 索引；知识库为空时返回 None，等首次上传时再创建"""
+    if len(vecs) == 0:
+        return None
+    vecs_faiss = np.array(vecs).astype("float32")
+    # 归一化向量，使内积等于余弦相似度
+    faiss.normalize_L2(vecs_faiss)
+    new_index = faiss.IndexFlatIP(vecs_faiss.shape[1])  # IP = Inner Product（内积）
+    new_index.add(vecs_faiss)
+    return new_index
 
-print(f"✅ FAISS 索引已创建，包含 {index.ntotal} 条知识向量")
+
+index = _build_index(knowledge_vecs)
+
+print(f"✅ FAISS 索引已创建，包含 {index.ntotal if index else 0} 条知识向量")
 
 
 def get_all_knowledge():
@@ -174,7 +182,10 @@ def add_knowledge(new_chunks):
     向知识库追加新的文本块，并同步更新 FAISS 索引
     返回：新增的块数、当前总块数
     """
-    global knowledge
+    global knowledge, index
+
+    if not new_chunks:
+        return 0, len(knowledge)
 
     # 1. 向量化
     new_vecs = model.encode(new_chunks)
@@ -184,8 +195,12 @@ def add_knowledge(new_chunks):
     faiss.normalize_L2(new_vecs_faiss)
 
     # 3. 追加到 knowledge 和 index，保证顺序一致
-    knowledge.extend(new_chunks)
-    index.add(new_vecs_faiss)
+    #    并发上传时若两步不在同一临界区内，索引下标会与 knowledge 错位，检索到错误内容
+    with _index_lock:
+        if index is None:
+            index = faiss.IndexFlatIP(new_vecs_faiss.shape[1])
+        knowledge.extend(new_chunks)
+        index.add(new_vecs_faiss)
 
     # 打印新增的每一块内容
     for i, chunk in enumerate(new_chunks):
@@ -204,8 +219,11 @@ def search_mostk(query_vec, K=16, threshold=0.4):
     query_vec_faiss = np.array([query_vec]).astype("float32")
     faiss.normalize_L2(query_vec_faiss)
 
-    # FAISS 检索
-    distances, indices = index.search(query_vec_faiss, K)
+    # FAISS 检索；与 add_knowledge 的索引追加互斥，避免并发读写索引
+    with _index_lock:
+        if index is None:
+            return []
+        distances, indices = index.search(query_vec_faiss, K)
 
     # distances 是余弦相似度（因为向量已归一化）
     # indices 是知识库中的索引位置
@@ -271,6 +289,23 @@ def calculate(expression):
     if not all(c in allowed_chars for c in expression):
         return "错误：表达式包含不支持的字符"
 
+    if len(expression) > 200:
+        return "错误：表达式过长"
+
+    # 限制幂运算，避免 9**9**9 这类指数爆炸在计算时耗尽 CPU/内存
+    try:
+        tree = ast.parse(expression, mode="eval")
+    except SyntaxError:
+        return "错误：表达式格式不正确"
+    for node in ast.walk(tree):
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Pow):
+            if not (
+                isinstance(node.right, ast.Constant)
+                and isinstance(node.right.value, (int, float))
+                and abs(node.right.value) <= 100
+            ):
+                return "错误：幂运算指数过大"
+
     try:
         # 使用 eval 计算，但限制全局和局部命名空间为空，避免执行危险代码
         result = eval(expression, {"__builtins__": {}}, {})
@@ -318,7 +353,17 @@ def call_llm(prompt, mode, tools=None):
         "Content-Type": "application/json",
         "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
     }
-    response = requests.post(url, headers=headers, json=data, stream=use_stream)
+    try:
+        response = requests.post(
+            url, headers=headers, json=data, stream=use_stream, timeout=(10, 120)
+        )
+    except requests.RequestException as e:
+        logger.error(f"模型调用失败:{e}")
+        return {"error": f"模型调用失败：{e}"}
+
+    if response.status_code >= 400:
+        logger.error(f"模型调用失败:HTTP {response.status_code}")
+        return {"error": f"模型调用失败：HTTP {response.status_code}"}
 
     if use_stream:
         full_content = ""
@@ -337,8 +382,11 @@ def call_llm(prompt, mode, tools=None):
                         continue
         return full_content
     else:
-        result = response.json()
-        return result
+        try:
+            return response.json()
+        except ValueError:
+            logger.error("模型返回无法解析的响应")
+            return {"error": "模型返回无法解析的响应"}
 
 
 def rag_chat(message, history):
