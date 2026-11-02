@@ -1,4 +1,5 @@
 import os
+import threading
 
 from dotenv import load_dotenv
 
@@ -145,23 +146,33 @@ def parse_file(filename, file_bytes):
 
 
 knowledge = load_knowledge("知识库简易版.txt", chunk_size=150)
-knowledge_vecs = model.encode(knowledge) if knowledge else []
 
 import faiss
 
-# 将知识向量转为 float32（FAISS 要求的数据类型）
-knowledge_vecs_faiss = np.array(knowledge_vecs).astype("float32")
+# FAISS 索引 —— 延迟到首次 add_knowledge 时再创建，避免空知识库启动崩溃
+index = None
+_FAISS_DIM = None
+# 保护 knowledge + index 一致性的锁：FAISS Index 不是线程安全的，
+# 多个并发 upload 会导致 knowledge 列表与 index 向量顺序错位或 FAISS 内部状态损坏
+_knowledge_lock = threading.Lock()
 
-# 获取向量维度
-dim = knowledge_vecs_faiss.shape[1]
 
-# 创建 FAISS 索引（使用内积索引，配合归一化实现余弦相似度）
-index = faiss.IndexFlatIP(dim)  # IP = Inner Product（内积）
-# 归一化向量，使内积等于余弦相似度
-faiss.normalize_L2(knowledge_vecs_faiss)
-index.add(knowledge_vecs_faiss)
+def _init_faiss_index(vecs):
+    """根据首次向量推断维度并创建 FAISS 索引（仅用于知识库非空场景）"""
+    global index, _FAISS_DIM
+    _FAISS_DIM = vecs.shape[1]
+    index = faiss.IndexFlatIP(_FAISS_DIM)
+    faiss.normalize_L2(vecs)
+    index.add(vecs)
 
-print(f"✅ FAISS 索引已创建，包含 {index.ntotal} 条知识向量")
+
+if knowledge:
+    knowledge_vecs = model.encode(knowledge)
+    knowledge_vecs_faiss = np.array(knowledge_vecs).astype("float32")
+    _init_faiss_index(knowledge_vecs_faiss)
+    print(f"✅ FAISS 索引已创建，包含 {index.ntotal} 条知识向量")
+else:
+    print("⚠️  知识库为空，FAISS 索引待首次 add_knowledge 时创建")
 
 
 def get_all_knowledge():
@@ -174,54 +185,65 @@ def add_knowledge(new_chunks):
     向知识库追加新的文本块，并同步更新 FAISS 索引
     返回：新增的块数、当前总块数
     """
-    global knowledge
+    global knowledge, index, _FAISS_DIM
 
-    # 1. 向量化
-    new_vecs = model.encode(new_chunks)
-    new_vecs_faiss = np.array(new_vecs).astype("float32")
+    with _knowledge_lock:
+        # 1. 向量化
+        new_vecs = model.encode(new_chunks)
+        new_vecs_faiss = np.array(new_vecs).astype("float32")
 
-    # 2. 归一化（FAISS 要求）
-    faiss.normalize_L2(new_vecs_faiss)
+        # 2. 首次调用时根据新向量推断维度并创建索引
+        if index is None:
+            _FAISS_DIM = new_vecs_faiss.shape[1]
+            index = faiss.IndexFlatIP(_FAISS_DIM)
 
-    # 3. 追加到 knowledge 和 index，保证顺序一致
-    knowledge.extend(new_chunks)
-    index.add(new_vecs_faiss)
+        # 3. 归一化（FAISS 要求）
+        faiss.normalize_L2(new_vecs_faiss)
 
-    # 打印新增的每一块内容
-    for i, chunk in enumerate(new_chunks):
-        logger.info(f"新增块 {i+1}: {chunk}...")
+        # 4. 追加到 knowledge 和 index，保证顺序一致
+        knowledge.extend(new_chunks)
+        index.add(new_vecs_faiss)
 
-    logger.info(f"知识库更新：新增 {len(new_chunks)} 块，当前共 {len(knowledge)} 块")
+        # 打印新增的每一块内容
+        for i, chunk in enumerate(new_chunks):
+            logger.info(f"新增块 {i+1}: {chunk}...")
 
-    return len(new_chunks), len(knowledge)
+        logger.info(f"知识库更新：新增 {len(new_chunks)} 块，当前共 {len(knowledge)} 块")
+
+        return len(new_chunks), len(knowledge)
 
 
 def search_mostk(query_vec, K=16, threshold=0.4):
     """
     使用 FAISS 检索最相关的 K 条知识
     """
-    # 将查询向量转为 float32 并归一化
-    query_vec_faiss = np.array([query_vec]).astype("float32")
-    faiss.normalize_L2(query_vec_faiss)
+    with _knowledge_lock:
+        if index is None or index.ntotal == 0 or not knowledge:
+            logger.warning("FAISS 索引或知识库为空，跳过检索")
+            return []
 
-    # FAISS 检索
-    distances, indices = index.search(query_vec_faiss, K)
+        # 将查询向量转为 float32 并归一化
+        query_vec_faiss = np.array([query_vec]).astype("float32")
+        faiss.normalize_L2(query_vec_faiss)
 
-    # distances 是余弦相似度（因为向量已归一化）
-    # indices 是知识库中的索引位置
+        # FAISS 检索
+        distances, indices = index.search(query_vec_faiss, K)
 
-    matched = []
-    for i, (dist, idx) in enumerate(zip(distances[0], indices[0])):
-        if idx == -1:
-            continue
-        sim = float(dist)  # dist 就是余弦相似度
-        logger.debug(f"🔍 知识块 {idx+1} 的注意力得分: {sim:.4f}")
-        if sim >= threshold:
-            matched.append(knowledge[idx])
-        else:
-            logger.debug(f"    ⏭️  知识块 {idx+1} 低于阈值 {threshold}，已跳过")
+        # distances 是余弦相似度（因为向量已归一化）
+        # indices 是知识库中的索引位置
+
+        matched = []
+        for i, (dist, idx) in enumerate(zip(distances[0], indices[0])):
+            if idx == -1:
+                continue
+            sim = float(dist)  # dist 就是余弦相似度
+            logger.debug(f"🔍 知识块 {idx+1} 的注意力得分: {sim:.4f}")
+            if sim >= threshold:
+                matched.append(knowledge[idx])
+            else:
+                logger.debug(f"    ⏭️  知识块 {idx+1} 低于阈值 {threshold}，已跳过")
         logger.info(f"检索完成:命中{len(matched)}条知识")
-    return matched[:K]
+        return matched[:K]
 
 
 def web_search_tavily(query):
@@ -318,7 +340,25 @@ def call_llm(prompt, mode, tools=None):
         "Content-Type": "application/json",
         "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
     }
-    response = requests.post(url, headers=headers, json=data, stream=use_stream)
+
+    # 分离 connect/read timeout，避免 API 无响应时永久挂起耗尽 FastAPI 线程池
+    try:
+        response = requests.post(
+            url, headers=headers, json=data, stream=use_stream,
+            timeout=(10, 300),  # 连接超时 10s，读取超时 300s（流式需要较长）
+        )
+    except requests.exceptions.RequestException as e:
+        logger.error(f"LLM 请求网络异常: {e}")
+        return {"error": f"网络请求失败: {e}"}
+
+    # 检查 HTTP 状态码，防止错误页面被当作正常响应解析
+    if response.status_code >= 400:
+        try:
+            err_body = response.json()
+        except Exception:
+            err_body = response.text[:200]
+        logger.error(f"LLM API 返回 {response.status_code}: {err_body}")
+        return {"error": f"API 返回 {response.status_code}: {err_body}"}
 
     if use_stream:
         full_content = ""
@@ -328,6 +368,10 @@ def call_llm(prompt, mode, tools=None):
                 if line.startswith("data: "):
                     try:
                         chunk = json.loads(line[6:])
+                        # 检查流中的 error 字段
+                        if "error" in chunk:
+                            logger.error(f"流式响应中包含 error: {chunk['error']}")
+                            return {"error": str(chunk["error"])}
                         delta = chunk.get("choices", [{}])[0].get("delta", {})
                         content = delta.get("content", "")
                         if content:
