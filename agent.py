@@ -1,4 +1,5 @@
 import os
+import threading
 
 from dotenv import load_dotenv
 
@@ -150,18 +151,27 @@ knowledge_vecs = model.encode(knowledge) if knowledge else []
 import faiss
 
 # 将知识向量转为 float32（FAISS 要求的数据类型）
-knowledge_vecs_faiss = np.array(knowledge_vecs).astype("float32")
+knowledge_vecs_faiss = np.array(knowledge_vecs).astype("float32") if knowledge else np.empty((0, 0), dtype="float32")
 
-# 获取向量维度
-dim = knowledge_vecs_faiss.shape[1]
+# 获取向量维度：知识库为空时从模型获取嵌入维度，避免 shape[1] 越界导致启动崩溃
+dim = (
+    knowledge_vecs_faiss.shape[1]
+    if knowledge_vecs_faiss.ndim == 2 and knowledge_vecs_faiss.shape[0] > 0
+    else model.get_sentence_embedding_dimension()
+)
 
 # 创建 FAISS 索引（使用内积索引，配合归一化实现余弦相似度）
 index = faiss.IndexFlatIP(dim)  # IP = Inner Product（内积）
 # 归一化向量，使内积等于余弦相似度
-faiss.normalize_L2(knowledge_vecs_faiss)
-index.add(knowledge_vecs_faiss)
+if knowledge:
+    faiss.normalize_L2(knowledge_vecs_faiss)
+    index.add(knowledge_vecs_faiss)
 
 print(f"✅ FAISS 索引已创建，包含 {index.ntotal} 条知识向量")
+
+
+# 知识库写操作锁：保证 knowledge 列表与 FAISS 索引的追加顺序一致，避免并发上传导致索引错位
+_knowledge_lock = threading.Lock()
 
 
 def get_all_knowledge():
@@ -176,6 +186,9 @@ def add_knowledge(new_chunks):
     """
     global knowledge
 
+    if not new_chunks:
+        return 0, len(knowledge)
+
     # 1. 向量化
     new_vecs = model.encode(new_chunks)
     new_vecs_faiss = np.array(new_vecs).astype("float32")
@@ -183,17 +196,18 @@ def add_knowledge(new_chunks):
     # 2. 归一化（FAISS 要求）
     faiss.normalize_L2(new_vecs_faiss)
 
-    # 3. 追加到 knowledge 和 index，保证顺序一致
-    knowledge.extend(new_chunks)
-    index.add(new_vecs_faiss)
+    # 3. 追加到 knowledge 和 index，保证顺序一致（加锁防止并发上传导致列表与索引错位）
+    with _knowledge_lock:
+        knowledge.extend(new_chunks)
+        index.add(new_vecs_faiss)
 
-    # 打印新增的每一块内容
-    for i, chunk in enumerate(new_chunks):
-        logger.info(f"新增块 {i+1}: {chunk}...")
+        # 打印新增的每一块内容
+        for i, chunk in enumerate(new_chunks):
+            logger.info(f"新增块 {i+1}: {chunk}...")
 
-    logger.info(f"知识库更新：新增 {len(new_chunks)} 块，当前共 {len(knowledge)} 块")
+        logger.info(f"知识库更新：新增 {len(new_chunks)} 块，当前共 {len(knowledge)} 块")
 
-    return len(new_chunks), len(knowledge)
+        return len(new_chunks), len(knowledge)
 
 
 def search_mostk(query_vec, K=16, threshold=0.4):
@@ -404,13 +418,21 @@ def rag_chat(message, history):
             if "tool_calls" in message_obj and message_obj["tool_calls"]:
                 tool_call = message_obj["tool_calls"][0]
                 tool_name = tool_call["function"]["name"]
-                tool_args = json.loads(tool_call["function"]["arguments"])
+                try:
+                    tool_args = json.loads(tool_call["function"]["arguments"])
+                except (json.JSONDecodeError, TypeError) as e:
+                    logger.error(f"工具参数解析失败: {e}, 原始参数: {tool_call['function'].get('arguments')}")
+                    return "工具调用参数解析失败，请重试"
 
                 logger.info(f"🔧 模型请求调用工具: {tool_name}")
                 logger.info(f"📝 工具参数: {tool_args}")
 
                 if tool_name == "search_web":
-                    search_results = web_search_tavily(tool_args["query"])
+                    query = tool_args.get("query")
+                    if not query:
+                        logger.error("search_web 缺少 query 参数")
+                        return "工具调用参数缺失：query"
+                    search_results = web_search_tavily(query)
                     logger.info(f"搜索完成,返回{search_results}字符")
                     context["tool_results"].append(
                         {"tool": tool_name, "args": tool_args, "result": search_results}
@@ -422,7 +444,11 @@ def rag_chat(message, history):
                     }
                     continue
                 elif tool_name == "calculate":
-                    result = calculate(tool_args["expression"])
+                    expression = tool_args.get("expression")
+                    if not expression:
+                        logger.error("calculate 缺少 expression 参数")
+                        return "工具调用参数缺失：expression"
+                    result = calculate(expression)
                     logger.info(f"计算结果:{result}")
                     context["tool_results"].append(
                         {"tool": tool_name, "args": tool_args, "result": result}
