@@ -1,4 +1,5 @@
 import os
+import threading
 
 from dotenv import load_dotenv
 
@@ -145,12 +146,15 @@ def parse_file(filename, file_bytes):
 
 
 knowledge = load_knowledge("知识库简易版.txt", chunk_size=150)
-knowledge_vecs = model.encode(knowledge) if knowledge else []
 
 import faiss
 
-# 将知识向量转为 float32（FAISS 要求的数据类型）
-knowledge_vecs_faiss = np.array(knowledge_vecs).astype("float32")
+# 处理空知识库：用一条占位文本编码以获取向量维度，避免 np.array([]).shape[1] 触发 IndexError
+if knowledge:
+    knowledge_vecs = model.encode(knowledge)
+    knowledge_vecs_faiss = np.array(knowledge_vecs).astype("float32")
+else:
+    knowledge_vecs_faiss = np.zeros((0, model.encode(["占位"]).shape[1]), dtype="float32")
 
 # 获取向量维度
 dim = knowledge_vecs_faiss.shape[1]
@@ -158,8 +162,12 @@ dim = knowledge_vecs_faiss.shape[1]
 # 创建 FAISS 索引（使用内积索引，配合归一化实现余弦相似度）
 index = faiss.IndexFlatIP(dim)  # IP = Inner Product（内积）
 # 归一化向量，使内积等于余弦相似度
-faiss.normalize_L2(knowledge_vecs_faiss)
-index.add(knowledge_vecs_faiss)
+if knowledge_vecs_faiss.shape[0] > 0:
+    faiss.normalize_L2(knowledge_vecs_faiss)
+    index.add(knowledge_vecs_faiss)
+
+# 保护共享可变状态（knowledge 列表与 FAISS index），避免 /chat 与 /upload 并发时崩溃或索引损坏
+_knowledge_lock = threading.Lock()
 
 print(f"✅ FAISS 索引已创建，包含 {index.ntotal} 条知识向量")
 
@@ -183,9 +191,10 @@ def add_knowledge(new_chunks):
     # 2. 归一化（FAISS 要求）
     faiss.normalize_L2(new_vecs_faiss)
 
-    # 3. 追加到 knowledge 和 index，保证顺序一致
-    knowledge.extend(new_chunks)
-    index.add(new_vecs_faiss)
+    # 3. 追加到 knowledge 和 index，保证顺序一致（加锁防止与检索并发导致索引损坏/崩溃）
+    with _knowledge_lock:
+        knowledge.extend(new_chunks)
+        index.add(new_vecs_faiss)
 
     # 打印新增的每一块内容
     for i, chunk in enumerate(new_chunks):
@@ -204,23 +213,21 @@ def search_mostk(query_vec, K=16, threshold=0.4):
     query_vec_faiss = np.array([query_vec]).astype("float32")
     faiss.normalize_L2(query_vec_faiss)
 
-    # FAISS 检索
-    distances, indices = index.search(query_vec_faiss, K)
+    # FAISS 检索（加锁：与 add_knowledge 并发时 FAISS 非线程安全，会崩溃或损坏索引）
+    with _knowledge_lock:
+        distances, indices = index.search(query_vec_faiss, K)
 
-    # distances 是余弦相似度（因为向量已归一化）
-    # indices 是知识库中的索引位置
-
-    matched = []
-    for i, (dist, idx) in enumerate(zip(distances[0], indices[0])):
-        if idx == -1:
-            continue
-        sim = float(dist)  # dist 就是余弦相似度
-        logger.debug(f"🔍 知识块 {idx+1} 的注意力得分: {sim:.4f}")
-        if sim >= threshold:
-            matched.append(knowledge[idx])
-        else:
-            logger.debug(f"    ⏭️  知识块 {idx+1} 低于阈值 {threshold}，已跳过")
-        logger.info(f"检索完成:命中{len(matched)}条知识")
+        matched = []
+        for i, (dist, idx) in enumerate(zip(distances[0], indices[0])):
+            if idx == -1:
+                continue
+            sim = float(dist)  # dist 就是余弦相似度
+            logger.debug(f"🔍 知识块 {idx+1} 的注意力得分: {sim:.4f}")
+            if sim >= threshold:
+                matched.append(knowledge[idx])
+            else:
+                logger.debug(f"    ⏭️  知识块 {idx+1} 低于阈值 {threshold}，已跳过")
+    logger.info(f"检索完成:命中{len(matched)}条知识")
     return matched[:K]
 
 
@@ -318,7 +325,7 @@ def call_llm(prompt, mode, tools=None):
         "Content-Type": "application/json",
         "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
     }
-    response = requests.post(url, headers=headers, json=data, stream=use_stream)
+    response = requests.post(url, headers=headers, json=data, stream=use_stream, timeout=60)
 
     if use_stream:
         full_content = ""
@@ -404,7 +411,11 @@ def rag_chat(message, history):
             if "tool_calls" in message_obj and message_obj["tool_calls"]:
                 tool_call = message_obj["tool_calls"][0]
                 tool_name = tool_call["function"]["name"]
-                tool_args = json.loads(tool_call["function"]["arguments"])
+                try:
+                    tool_args = json.loads(tool_call["function"]["arguments"])
+                except (json.JSONDecodeError, TypeError, KeyError) as e:
+                    logger.error(f"工具调用参数解析失败: {e}")
+                    return f"工具调用参数解析失败: {e}"
 
                 logger.info(f"🔧 模型请求调用工具: {tool_name}")
                 logger.info(f"📝 工具参数: {tool_args}")
