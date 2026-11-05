@@ -1,4 +1,5 @@
 import os
+import threading
 
 from dotenv import load_dotenv
 
@@ -10,7 +11,6 @@ import numpy as np
 import fitz
 from text2vec import SentenceModel
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from tavily import TavilyClient
 from logger_utils import logger
 from docx import Document
 
@@ -19,8 +19,22 @@ DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
 TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")
 url = "https://api.deepseek.com/v1/chat/completions"
 
-# ===== 初始化 Tavily 客户端 =====
-tavily_client = TavilyClient(api_key=TAVILY_API_KEY)
+# ===== 延迟初始化 Tavily 客户端（避免 API Key 缺失时启动崩溃） =====
+tavily_client = None
+
+# ===== 知识库与 FAISS 索引的读写锁（FAISS IndexFlatIP 不是线程安全的） =====
+_knowledge_lock = threading.Lock()
+
+
+def _get_tavily_client():
+    """延迟初始化 Tavily 客户端，避免 API Key 缺失时启动崩溃"""
+    global tavily_client
+    if tavily_client is None:
+        if not TAVILY_API_KEY:
+            raise RuntimeError("TAVILY_API_KEY 未配置，无法使用联网搜索功能")
+        from tavily import TavilyClient
+        tavily_client = TavilyClient(api_key=TAVILY_API_KEY)
+    return tavily_client
 
 SYSTEM_PROMPT = """
 你是一个专业的技术顾问，也是一个自主决策的智能助手。
@@ -149,24 +163,26 @@ knowledge_vecs = model.encode(knowledge) if knowledge else []
 
 import faiss
 
-# 将知识向量转为 float32（FAISS 要求的数据类型）
-knowledge_vecs_faiss = np.array(knowledge_vecs).astype("float32")
-
-# 获取向量维度
-dim = knowledge_vecs_faiss.shape[1]
-
-# 创建 FAISS 索引（使用内积索引，配合归一化实现余弦相似度）
-index = faiss.IndexFlatIP(dim)  # IP = Inner Product（内积）
-# 归一化向量，使内积等于余弦相似度
-faiss.normalize_L2(knowledge_vecs_faiss)
-index.add(knowledge_vecs_faiss)
-
-print(f"✅ FAISS 索引已创建，包含 {index.ntotal} 条知识向量")
+# ===== 初始化 FAISS 索引（空知识库时跳过，避免 shape[1] IndexError 导致启动崩溃） =====
+if knowledge:
+    knowledge_vecs_faiss = np.array(knowledge_vecs).astype("float32")
+    dim = knowledge_vecs_faiss.shape[1]
+    index = faiss.IndexFlatIP(dim)
+    faiss.normalize_L2(knowledge_vecs_faiss)
+    index.add(knowledge_vecs_faiss)
+    print(f"✅ FAISS 索引已创建，包含 {index.ntotal} 条知识向量，维度 {dim}")
+else:
+    # 用占位维度初始化空索引，首次 add 时会适配实际维度
+    # 但更安全的做法是延迟到 add_knowledge 首次调用时创建索引
+    dim = 0
+    index = None
+    logger.warning("知识库为空，FAISS 索引未创建。等待 /upload 接口首次添加知识时自动初始化。")
 
 
 def get_all_knowledge():
     """返回当前知识库里的所有文本块"""
-    return knowledge
+    with _knowledge_lock:
+        return list(knowledge)
 
 
 def add_knowledge(new_chunks):
@@ -174,7 +190,7 @@ def add_knowledge(new_chunks):
     向知识库追加新的文本块，并同步更新 FAISS 索引
     返回：新增的块数、当前总块数
     """
-    global knowledge
+    global knowledge, index, dim
 
     # 1. 向量化
     new_vecs = model.encode(new_chunks)
@@ -183,11 +199,19 @@ def add_knowledge(new_chunks):
     # 2. 归一化（FAISS 要求）
     faiss.normalize_L2(new_vecs_faiss)
 
-    # 3. 追加到 knowledge 和 index，保证顺序一致
-    knowledge.extend(new_chunks)
-    index.add(new_vecs_faiss)
+    # 3. 加锁后再操作全局状态，保证 knowledge 与 index 同步
+    with _knowledge_lock:
+        # 如果索引还未创建（空知识库启动场景），用首批向量的维度创建
+        if index is None:
+            dim = new_vecs_faiss.shape[1]
+            index = faiss.IndexFlatIP(dim)
+            logger.info(f"首次初始化 FAISS 索引，维度 {dim}")
 
-    # 打印新增的每一块内容
+        # 追加到 knowledge 和 index，保证顺序一致
+        knowledge.extend(new_chunks)
+        index.add(new_vecs_faiss)
+
+    # 打印新增的每一块内容（在锁外，避免阻塞其他持有者）
     for i, chunk in enumerate(new_chunks):
         logger.info(f"新增块 {i+1}: {chunk}...")
 
@@ -204,23 +228,31 @@ def search_mostk(query_vec, K=16, threshold=0.4):
     query_vec_faiss = np.array([query_vec]).astype("float32")
     faiss.normalize_L2(query_vec_faiss)
 
-    # FAISS 检索
-    distances, indices = index.search(query_vec_faiss, K)
+    # 加锁后访问共享的 FAISS 索引和 knowledge 列表
+    with _knowledge_lock:
+        # 防御：空索引或空知识库，直接返回空结果
+        if index is None or index.ntotal == 0 or not knowledge:
+            logger.warning("FAISS 索引为空，无法检索")
+            return []
 
-    # distances 是余弦相似度（因为向量已归一化）
-    # indices 是知识库中的索引位置
+        # FAISS 检索
+        distances, indices = index.search(query_vec_faiss, K)
 
-    matched = []
-    for i, (dist, idx) in enumerate(zip(distances[0], indices[0])):
-        if idx == -1:
-            continue
-        sim = float(dist)  # dist 就是余弦相似度
-        logger.debug(f"🔍 知识块 {idx+1} 的注意力得分: {sim:.4f}")
-        if sim >= threshold:
-            matched.append(knowledge[idx])
-        else:
-            logger.debug(f"    ⏭️  知识块 {idx+1} 低于阈值 {threshold}，已跳过")
-        logger.info(f"检索完成:命中{len(matched)}条知识")
+        matched = []
+        for dist, idx in zip(distances[0], indices[0]):
+            if idx == -1:
+                continue
+            if idx >= len(knowledge):
+                logger.error(f"索引越界: idx={idx}, knowledge 长度={len(knowledge)}")
+                continue
+            sim = float(dist)
+            logger.debug(f"🔍 知识块 {idx+1} 的注意力得分: {sim:.4f}")
+            if sim >= threshold:
+                matched.append(knowledge[idx])
+            else:
+                logger.debug(f"    ⏭️  知识块 {idx+1} 低于阈值 {threshold}，已跳过")
+
+    logger.info(f"检索完成:命中{len(matched)}条知识")
     return matched[:K]
 
 
@@ -229,7 +261,8 @@ def web_search_tavily(query):
     使用 Tavily 进行联网搜索，返回结构化的搜索结果
     """
     try:
-        response = tavily_client.search(
+        client = _get_tavily_client()
+        response = client.search(
             query=query,
             search_depth="basic",  # basic 消耗 1 个信用点，advanced 消耗 2 个
             max_results=3,
