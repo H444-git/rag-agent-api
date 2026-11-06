@@ -1,4 +1,5 @@
 import os
+import threading
 
 from dotenv import load_dotenv
 
@@ -20,7 +21,15 @@ TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")
 url = "https://api.deepseek.com/v1/chat/completions"
 
 # ===== 初始化 Tavily 客户端 =====
+if not TAVILY_API_KEY:
+    logger.warning("TAVILY_API_KEY 未设置，联网搜索功能不可用")
 tavily_client = TavilyClient(api_key=TAVILY_API_KEY)
+
+if not DEEPSEEK_API_KEY:
+    logger.warning("DEEPSEEK_API_KEY 未设置，LLM 调用将失败")
+
+# ===== FAISS 锁（保护 knowledge 列表和 index 的一致性）=====
+_faiss_lock = threading.Lock()
 
 SYSTEM_PROMPT = """
 你是一个专业的技术顾问，也是一个自主决策的智能助手。
@@ -149,17 +158,25 @@ knowledge_vecs = model.encode(knowledge) if knowledge else []
 
 import faiss
 
-# 将知识向量转为 float32（FAISS 要求的数据类型）
-knowledge_vecs_faiss = np.array(knowledge_vecs).astype("float32")
+# ===== FAISS 索引初始化 =====
+# 必须使用已知维度的零向量占位，防止知识库为空时 shape[1] 越界崩溃
+# 用一条虚拟向量初始化索引，add_knowledge 会自动添加真实数据
+_dimension = model.get_sentence_embedding_dimension()
+knowledge_vecs_faiss = np.array(knowledge_vecs, dtype="float32") if knowledge_vecs else np.zeros((0, _dimension), dtype="float32")
 
-# 获取向量维度
-dim = knowledge_vecs_faiss.shape[1]
-
-# 创建 FAISS 索引（使用内积索引，配合归一化实现余弦相似度）
-index = faiss.IndexFlatIP(dim)  # IP = Inner Product（内积）
-# 归一化向量，使内积等于余弦相似度
-faiss.normalize_L2(knowledge_vecs_faiss)
-index.add(knowledge_vecs_faiss)
+if knowledge_vecs_faiss.size == 0:
+    logger.warning("知识库为空，创建空 FAISS 索引")
+    # 用一条零向量初始化空索引（索引需要知道维度）
+    index = faiss.IndexFlatIP(_dimension)
+else:
+    # 将知识向量转为 float32（FAISS 要求的数据类型）
+    knowledge_vecs_faiss = knowledge_vecs_faiss.astype("float32")
+    dim = knowledge_vecs_faiss.shape[1]
+    # 创建 FAISS 索引（使用内积索引，配合归一化实现余弦相似度）
+    index = faiss.IndexFlatIP(dim)  # IP = Inner Product（内积）
+    # 归一化向量，使内积等于余弦相似度
+    faiss.normalize_L2(knowledge_vecs_faiss)
+    index.add(knowledge_vecs_faiss)
 
 print(f"✅ FAISS 索引已创建，包含 {index.ntotal} 条知识向量")
 
@@ -173,19 +190,25 @@ def add_knowledge(new_chunks):
     """
     向知识库追加新的文本块，并同步更新 FAISS 索引
     返回：新增的块数、当前总块数
+    线程安全：使用 _faiss_lock 保证 knowledge 列表与 index 的原子性更新
     """
     global knowledge
 
-    # 1. 向量化
+    if not new_chunks:
+        logger.warning("add_knowledge 收到空块列表，跳过")
+        return 0, len(knowledge)
+
+    # 1. 向量化（向量化操作无共享状态，可以在锁外执行）
     new_vecs = model.encode(new_chunks)
-    new_vecs_faiss = np.array(new_vecs).astype("float32")
+    new_vecs_faiss = np.array(new_vecs, dtype="float32")
 
     # 2. 归一化（FAISS 要求）
     faiss.normalize_L2(new_vecs_faiss)
 
-    # 3. 追加到 knowledge 和 index，保证顺序一致
-    knowledge.extend(new_chunks)
-    index.add(new_vecs_faiss)
+    # 3. 原子性地追加到 knowledge 和 index，保证顺序严格一致
+    with _faiss_lock:
+        knowledge.extend(new_chunks)
+        index.add(new_vecs_faiss)
 
     # 打印新增的每一块内容
     for i, chunk in enumerate(new_chunks):
@@ -199,28 +222,40 @@ def add_knowledge(new_chunks):
 def search_mostk(query_vec, K=16, threshold=0.4):
     """
     使用 FAISS 检索最相关的 K 条知识
+    线程安全：读操作也需要加锁，防止遍历 knowledge 时被并发修改
     """
     # 将查询向量转为 float32 并归一化
-    query_vec_faiss = np.array([query_vec]).astype("float32")
+    query_vec_faiss = np.array([query_vec], dtype="float32")
     faiss.normalize_L2(query_vec_faiss)
 
-    # FAISS 检索
-    distances, indices = index.search(query_vec_faiss, K)
+    # 对 FAISS 搜索和 knowledge 访问加锁，保证一致性
+    with _faiss_lock:
+        if index.ntotal == 0 or not knowledge:
+            logger.info("FAISS 索引或知识库为空，跳过检索")
+            return []
 
-    # distances 是余弦相似度（因为向量已归一化）
-    # indices 是知识库中的索引位置
+        # FAISS 检索
+        distances, indices = index.search(query_vec_faiss, K)
 
-    matched = []
-    for i, (dist, idx) in enumerate(zip(distances[0], indices[0])):
-        if idx == -1:
-            continue
-        sim = float(dist)  # dist 就是余弦相似度
-        logger.debug(f"🔍 知识块 {idx+1} 的注意力得分: {sim:.4f}")
-        if sim >= threshold:
-            matched.append(knowledge[idx])
-        else:
-            logger.debug(f"    ⏭️  知识块 {idx+1} 低于阈值 {threshold}，已跳过")
-        logger.info(f"检索完成:命中{len(matched)}条知识")
+        # distances 是余弦相似度（因为向量已归一化）
+        # indices 是知识库中的索引位置
+
+        matched = []
+        for dist, idx in zip(distances[0], indices[0]):
+            if idx == -1:
+                continue
+            # 越界防护：防止 knowledge 被并发修改导致索引超出范围
+            if idx < 0 or idx >= len(knowledge):
+                logger.warning(f"FAISS 返回索引 {idx} 超出知识库范围 (size={len(knowledge)})，已跳过")
+                continue
+            sim = float(dist)  # dist 就是余弦相似度
+            logger.debug(f"🔍 知识块 {idx+1} 的注意力得分: {sim:.4f}")
+            if sim >= threshold:
+                matched.append(knowledge[idx])
+            else:
+                logger.debug(f"    ⏭️  知识块 {idx+1} 低于阈值 {threshold}，已跳过")
+
+    logger.info(f"检索完成: 命中 {len(matched)} 条知识")
     return matched[:K]
 
 
@@ -318,7 +353,18 @@ def call_llm(prompt, mode, tools=None):
         "Content-Type": "application/json",
         "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
     }
-    response = requests.post(url, headers=headers, json=data, stream=use_stream)
+
+    try:
+        response = requests.post(
+            url,
+            headers=headers,
+            json=data,
+            stream=use_stream,
+            timeout=60,  # 防止网络请求永久阻塞（流式响应也有超时）
+        )
+    except requests.RequestException as e:
+        logger.error(f"LLM 请求失败: {e}")
+        return {"error": f"LLM 网络请求失败: {str(e)}"}
 
     if use_stream:
         full_content = ""

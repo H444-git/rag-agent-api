@@ -43,7 +43,7 @@ async def upload(file: UploadFile = File(...)):
         }
 
     except Exception as e:
-        logger.error("文件上传失败:{e}")
+        logger.error(f"文件上传失败: {e}")
         return {"message": "上传失败", "error": str(e)}
 
 
