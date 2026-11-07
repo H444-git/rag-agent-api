@@ -1,4 +1,6 @@
+import ast
 import os
+import threading
 
 from dotenv import load_dotenv
 
@@ -149,24 +151,33 @@ knowledge_vecs = model.encode(knowledge) if knowledge else []
 
 import faiss
 
+# 知识库列表与 FAISS 索引必须作为一个整体读写：
+# /chat 在 FastAPI 线程池中检索，/upload 在事件循环线程中写入，二者会真正并行
+_kb_lock = threading.RLock()
+
 # 将知识向量转为 float32（FAISS 要求的数据类型）
 knowledge_vecs_faiss = np.array(knowledge_vecs).astype("float32")
 
-# 获取向量维度
-dim = knowledge_vecs_faiss.shape[1]
+# 获取向量维度（知识库为空时 encode 返回一维空数组，无法从形状推断维度）
+if knowledge_vecs_faiss.ndim == 2:
+    dim = knowledge_vecs_faiss.shape[1]
+else:
+    dim = int(model.get_sentence_embedding_dimension())
 
 # 创建 FAISS 索引（使用内积索引，配合归一化实现余弦相似度）
 index = faiss.IndexFlatIP(dim)  # IP = Inner Product（内积）
-# 归一化向量，使内积等于余弦相似度
-faiss.normalize_L2(knowledge_vecs_faiss)
-index.add(knowledge_vecs_faiss)
+if knowledge_vecs_faiss.size:
+    # 归一化向量，使内积等于余弦相似度
+    faiss.normalize_L2(knowledge_vecs_faiss)
+    index.add(knowledge_vecs_faiss)
 
 print(f"✅ FAISS 索引已创建，包含 {index.ntotal} 条知识向量")
 
 
 def get_all_knowledge():
-    """返回当前知识库里的所有文本块"""
-    return knowledge
+    """返回当前知识库里的所有文本块（快照，避免并发写入时序列化出错）"""
+    with _kb_lock:
+        return list(knowledge)
 
 
 def add_knowledge(new_chunks):
@@ -176,6 +187,10 @@ def add_knowledge(new_chunks):
     """
     global knowledge
 
+    # 空文件不会产生任何块，直接返回，避免后续按一维空数组处理
+    if not new_chunks:
+        return 0, len(knowledge)
+
     # 1. 向量化
     new_vecs = model.encode(new_chunks)
     new_vecs_faiss = np.array(new_vecs).astype("float32")
@@ -184,8 +199,10 @@ def add_knowledge(new_chunks):
     faiss.normalize_L2(new_vecs_faiss)
 
     # 3. 追加到 knowledge 和 index，保证顺序一致
-    knowledge.extend(new_chunks)
-    index.add(new_vecs_faiss)
+    #    FAISS 不支持 add 与 search 并发，且索引重分配期间读取会崩溃，必须整体加锁
+    with _kb_lock:
+        index.add(new_vecs_faiss)
+        knowledge.extend(new_chunks)
 
     # 打印新增的每一块内容
     for i, chunk in enumerate(new_chunks):
@@ -204,8 +221,9 @@ def search_mostk(query_vec, K=16, threshold=0.4):
     query_vec_faiss = np.array([query_vec]).astype("float32")
     faiss.normalize_L2(query_vec_faiss)
 
-    # FAISS 检索
-    distances, indices = index.search(query_vec_faiss, K)
+    # FAISS 检索（与 add_knowledge 的写入互斥，避免索引扩容时并发读到已释放内存）
+    with _kb_lock:
+        distances, indices = index.search(query_vec_faiss, K)
 
     # distances 是余弦相似度（因为向量已归一化）
     # indices 是知识库中的索引位置
@@ -262,6 +280,33 @@ def web_search_tavily(query):
         return f"搜索失败: {str(e)}"
 
 
+_MAX_POW_EXPONENT = 1000
+
+
+def validate_expression(node):
+    """只允许数字常量与四则/取模/幂运算，并限制幂指数规模"""
+    if isinstance(node, ast.BinOp) and isinstance(
+        node.op, (ast.Add, ast.Sub, ast.Mult, ast.Div, ast.Mod, ast.Pow)
+    ):
+        validate_expression(node.left)
+        validate_expression(node.right)
+        if isinstance(node.op, ast.Pow):
+            exp = node.right
+            if isinstance(exp, ast.UnaryOp) and isinstance(exp.op, (ast.UAdd, ast.USub)):
+                exp = exp.operand
+            if not isinstance(exp, ast.Constant) or not isinstance(exp.value, (int, float)):
+                raise ValueError("指数必须是数字")
+            if abs(exp.value) > _MAX_POW_EXPONENT:
+                raise ValueError("指数过大")
+    elif isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.UAdd, ast.USub)):
+        validate_expression(node.operand)
+    elif isinstance(node, ast.Constant):
+        if not isinstance(node.value, (int, float)):
+            raise ValueError("表达式包含不支持的常量")
+    else:
+        raise ValueError("表达式包含不支持的语法")
+
+
 def calculate(expression):
     """
     安全地计算数学表达式
@@ -272,8 +317,11 @@ def calculate(expression):
         return "错误：表达式包含不支持的字符"
 
     try:
+        # 先校验语法树，拦截 9**9**9 这类无界幂运算（会导致 CPU/内存耗尽）
+        tree = ast.parse(expression, mode="eval")
+        validate_expression(tree.body)
         # 使用 eval 计算，但限制全局和局部命名空间为空，避免执行危险代码
-        result = eval(expression, {"__builtins__": {}}, {})
+        result = eval(compile(tree, "<calculate>", "eval"), {"__builtins__": {}}, {})
         return f"计算结果：{expression} = {result}"
     except Exception as e:
         return f"计算错误：{str(e)}"
